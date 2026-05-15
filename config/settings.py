@@ -130,11 +130,18 @@ SPECTACULAR_SETTINGS = {
 CORS_ALLOWED_ORIGINS = env.list('CORS_ALLOWED_ORIGINS', default=['http://localhost:5173'])
 CORS_ALLOW_CREDENTIALS = True
 
-# ShipStation
-SHIPSTATION_API_KEY = env('SHIPSTATION_API_KEY', default='')
-SHIPSTATION_API_SECRET = env('SHIPSTATION_API_SECRET', default='')
+# Field-level encryption
+FIELD_ENCRYPTION_KEY = env('FIELD_ENCRYPTION_KEY', default='')
+
+# ShipStation (legacy global key — per-account keys stored in DB)
 SHIPSTATION_BASE_URL = env('SHIPSTATION_BASE_URL', default='https://api.shipstation.com')
 
 # Celery
 CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+CELERY_BEAT_SCHEDULE = {
+    'sync-all-shipstation-accounts': {
+        'task': 'apps.shipping.tasks.sync_all_active_accounts',
+        'schedule': 900,  # every 15 minutes (fallback if webhook missed)
+    },
+}

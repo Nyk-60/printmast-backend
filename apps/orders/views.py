@@ -4,7 +4,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import Order, OrderItem, UserProductMapping
+from .models import Order, OrderItem, ProductMapping
 from .serializers import (
     AddressUpdateSerializer,
     MatchItemSerializer,
@@ -13,13 +13,22 @@ from .serializers import (
 )
 
 
-class OrderViewSet(viewsets.ModelViewSet):
+class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = (IsAuthenticated,)
     filterset_fields = ('status', 'store')
-    search_fields = ('external_order_number', 'customer_name')
+    search_fields = ('shipstation_order_number', 'customer_name', 'external_order_number')
 
     def get_queryset(self):
-        return Order.objects.filter(owner=self.request.user).select_related('store').prefetch_related('items')
+        user = self.request.user
+        if user.is_sub_user:
+            return Order.objects.filter(
+                sub_user=user.sub_user_profile
+            ).select_related('store').prefetch_related('items')
+        if user.is_print_center:
+            return Order.objects.filter(
+                store__shipstation_account__print_center=user.print_center_profile
+            ).select_related('store', 'sub_user__user').prefetch_related('items')
+        return Order.objects.none()
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -32,44 +41,48 @@ class OrderViewSet(viewsets.ModelViewSet):
         serializer = AddressUpdateSerializer(order, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        # TODO: push update to ShipStation via apps.shipping.services
         return Response(OrderDetailSerializer(order).data)
 
     @action(detail=True, methods=['post'], url_path='match')
     def match(self, request, pk=None):
         order = self.get_object()
-        serializer = MatchItemSerializer(data=request.data, many=isinstance(request.data, list))
+        data = request.data if isinstance(request.data, list) else [request.data]
+        serializer = MatchItemSerializer(data=data, many=True)
         serializer.is_valid(raise_exception=True)
-        payload = serializer.validated_data if isinstance(serializer.validated_data, list) else [serializer.validated_data]
 
-        for entry in payload:
+        for entry in serializer.validated_data:
             try:
                 item = order.items.get(id=entry['item_id'])
             except OrderItem.DoesNotExist:
                 continue
-            item.catalog_variant_id = entry['catalog_variant_id']
+            item.pc_variant_id = entry['pc_variant_id']
             item.matched_at = timezone.now()
-            item.save(update_fields=['catalog_variant', 'matched_at'])
+            item.save(update_fields=['pc_variant', 'matched_at'])
 
-            if entry.get('remember') and item.raw_variant:
-                UserProductMapping.objects.update_or_create(
-                    owner=request.user,
-                    etsy_variant_name=item.raw_variant,
-                    defaults={'catalog_variant_id': entry['catalog_variant_id']},
+            if entry.get('remember'):
+                ProductMapping.objects.update_or_create(
+                    sub_user=request.user.sub_user_profile,
+                    store=order.store,
+                    marketplace_sku=item.marketplace_sku,
+                    marketplace_variant=str(item.raw_options),
+                    defaults={'pc_variant_id': entry['pc_variant_id']},
                 )
 
-        if not order.items.filter(catalog_variant__isnull=True).exists():
-            order.status = 'matched'
+        if not order.items.filter(pc_variant__isnull=True).exists():
+            order.status = Order.Status.READY
             order.save(update_fields=['status'])
 
         return Response(OrderDetailSerializer(order).data)
 
-    @action(detail=True, methods=['post'], url_path='send-to-production')
-    def send_to_production(self, request, pk=None):
+    @action(detail=True, methods=['post'], url_path='send-to-print')
+    def send_to_print(self, request, pk=None):
         order = self.get_object()
-        if order.status != 'matched':
-            return Response({'detail': 'Order must be matched first'}, status=status.HTTP_400_BAD_REQUEST)
-        order.status = 'in_production'
+        if order.status not in (Order.Status.READY, Order.Status.MATCHING):
+            return Response(
+                {'detail': 'Order is not ready for production'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.status = Order.Status.SENT_TO_PRINT
         order.save(update_fields=['status'])
-        # TODO: create label via ShipStation, debit balance, enqueue production job
+        # Balance debit + label purchase handled in production phase
         return Response(OrderDetailSerializer(order).data)
