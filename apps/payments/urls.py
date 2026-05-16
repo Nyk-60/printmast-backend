@@ -1,12 +1,26 @@
 from django.urls import path
-from rest_framework.routers import DefaultRouter
 
-from .views import AddFundsView, BalanceView, TransactionViewSet
-
-router = DefaultRouter()
-router.register('transactions', TransactionViewSet, basename='transaction')
+from .views import (
+    FinanceOverviewView,
+    MyTransactionExportView,
+    MyTransactionListView,
+    MySummaryView,
+    SubUserSummaryView,
+    SubUserTransactionExportView,
+    SubUserTransactionListView,
+)
 
 urlpatterns = [
-    path('balance/', BalanceView.as_view(), name='balance'),
-    path('add-funds/', AddFundsView.as_view(), name='add-funds'),
-] + router.urls
+    # Sub-user: own finance
+    path('my/summary/', MySummaryView.as_view(), name='my-finance-summary'),
+    path('my/transactions/', MyTransactionListView.as_view(), name='my-transactions'),
+    path('my/download/', MyTransactionExportView.as_view(), name='my-transactions-export'),
+
+    # Print center: all sub-users overview
+    path('overview/', FinanceOverviewView.as_view(), name='finance-overview'),
+
+    # Print center: per sub-user
+    path('sub-users/<int:pk>/summary/', SubUserSummaryView.as_view(), name='sub-finance-summary'),
+    path('sub-users/<int:pk>/transactions/', SubUserTransactionListView.as_view(), name='sub-transactions'),
+    path('sub-users/<int:pk>/download/', SubUserTransactionExportView.as_view(), name='sub-transactions-export'),
+]
