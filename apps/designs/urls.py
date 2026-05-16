@@ -1,9 +1,15 @@
-from rest_framework.routers import DefaultRouter
+from django.urls import path
 
-from .views import DesignViewSet, UserSkuDesignViewSet
+from .views import (
+    ColorCategoryListView,
+    ColorCategoryUploadView,
+    SkuDesignDetailView,
+    SkuDesignListCreateView,
+)
 
-router = DefaultRouter()
-router.register('sku-mappings', UserSkuDesignViewSet, basename='sku-design')
-router.register('', DesignViewSet, basename='design')
-
-urlpatterns = router.urls
+urlpatterns = [
+    path('sku/', SkuDesignListCreateView.as_view(), name='sku-design-list'),
+    path('sku/<int:pk>/', SkuDesignDetailView.as_view(), name='sku-design-detail'),
+    path('color-categories/', ColorCategoryListView.as_view(), name='color-category-list'),
+    path('color-categories/upload/', ColorCategoryUploadView.as_view(), name='color-category-upload'),
+]
