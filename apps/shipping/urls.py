@@ -4,10 +4,18 @@ from .views import (
     AccountDetailView,
     AccountListCreateView,
     AccountSyncView,
+    AccountWebhookRegisterView,
+    MyServiceDefaultsView,
+    MyServiceOptionsView,
+    MyStoresSyncView,
     RatesView,
+    ServiceOptionDetailView,
+    ServiceOptionListCreateView,
     ShipStationWebhookView,
     StoreAssignView,
     StoreListView,
+    StoreSyncView,
+    StoreUpdateView,
 )
 
 urlpatterns = [
@@ -15,10 +23,24 @@ urlpatterns = [
     path('accounts/', AccountListCreateView.as_view(), name='ss-account-list'),
     path('accounts/<int:pk>/', AccountDetailView.as_view(), name='ss-account-detail'),
     path('accounts/<int:pk>/sync/', AccountSyncView.as_view(), name='ss-account-sync'),
+    path('accounts/<int:pk>/register-webhooks/', AccountWebhookRegisterView.as_view(), name='ss-webhook-register'),
 
     # Store management (print center)
     path('stores/', StoreListView.as_view(), name='store-list'),
+    path('stores/<int:pk>/', StoreUpdateView.as_view(), name='store-update'),
     path('stores/<int:pk>/assign/', StoreAssignView.as_view(), name='store-assign'),
+    path('stores/<int:pk>/sync/', StoreSyncView.as_view(), name='store-sync'),
+
+    # Sub-user sync trigger
+    path('stores/sync-mine/', MyStoresSyncView.as_view(), name='my-stores-sync'),
+
+    # Shipping service options (print center configures per category)
+    path('service-options/mine/', MyServiceOptionsView.as_view(), name='service-options-mine'),
+    path('service-options/', ServiceOptionListCreateView.as_view(), name='service-option-list'),
+    path('service-options/<int:pk>/', ServiceOptionDetailView.as_view(), name='service-option-detail'),
+
+    # Shipping service defaults (sub-user picks default per category)
+    path('service-defaults/', MyServiceDefaultsView.as_view(), name='service-defaults'),
 
     # Rates (sub-user)
     path('rates/', RatesView.as_view(), name='shipping-rates'),

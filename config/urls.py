@@ -9,7 +9,7 @@ api_v1 = [
     path('catalog/', include('apps.catalog.urls')),
     path('orders/', include('apps.orders.urls')),
     path('designs/', include('apps.designs.urls')),
-    path('payments/', include('apps.payments.urls')),
+    path('finance/', include('apps.payments.urls')),
     path('shipping/', include('apps.shipping.urls')),
     path('production/', include('apps.production.urls')),
 ]

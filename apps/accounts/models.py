@@ -73,6 +73,18 @@ class PrintCenterProfile(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     max_sub_users = models.PositiveIntegerField(null=True, blank=True)  # null = unlimited
     timezone = models.CharField(max_length=64, default='UTC')
+    logo = models.ImageField(upload_to='print_center_logos/', null=True, blank=True)
+    monthly_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+
+    # Ship-from address (physical location orders are sent from)
+    ship_from_name       = models.CharField(max_length=200, blank=True)
+    ship_from_phone      = models.CharField(max_length=30,  blank=True)
+    ship_from_street1    = models.CharField(max_length=200, blank=True)
+    ship_from_street2    = models.CharField(max_length=200, blank=True)
+    ship_from_city       = models.CharField(max_length=120, blank=True)
+    ship_from_state      = models.CharField(max_length=80,  blank=True)
+    ship_from_postal_code = models.CharField(max_length=20, blank=True)
+    ship_from_country    = models.CharField(max_length=2,   blank=True, default='US')
 
     def __str__(self):
         return self.company_name
@@ -82,6 +94,61 @@ class PrintCenterProfile(TimeStampedModel):
         if self.max_sub_users is None:
             return True
         return self.sub_users.count() < self.max_sub_users
+
+
+class PrintCenterPricingTier(TimeStampedModel):
+    """Configurable item-count based extra fee tiers per print center."""
+    print_center = models.ForeignKey(
+        PrintCenterProfile, on_delete=models.CASCADE, related_name='pricing_tiers'
+    )
+    min_items = models.PositiveIntegerField()
+    max_items = models.PositiveIntegerField(null=True, blank=True)  # null = unlimited
+    extra_fee = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        ordering = ['min_items']
+
+    def __str__(self):
+        upper = self.max_items or '∞'
+        return f"{self.print_center.company_name}: {self.min_items}–{upper} → +${self.extra_fee}"
+
+
+class PrintCenterInvoice(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        PAID = 'paid', 'Paid'
+        OVERDUE = 'overdue', 'Overdue'
+
+    print_center = models.ForeignKey(
+        PrintCenterProfile, on_delete=models.CASCADE, related_name='invoices'
+    )
+    period_year = models.PositiveIntegerField()
+    period_month = models.PositiveIntegerField()
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    due_date = models.DateField()
+    paid_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = ('print_center', 'period_year', 'period_month')
+        ordering = ['-period_year', '-period_month']
+
+    def __str__(self):
+        return f"{self.print_center.company_name} {self.period_year}/{self.period_month:02d}"
+
+
+class ImpersonationLog(TimeStampedModel):
+    """Audit trail: which super admin accessed which print center account."""
+    admin = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, related_name='impersonation_logs'
+    )
+    print_center = models.ForeignKey(
+        PrintCenterProfile, on_delete=models.CASCADE, related_name='impersonation_logs'
+    )
+
+    def __str__(self):
+        return f"{self.admin.email} → {self.print_center.company_name}"
 
 
 class SubUserProfile(TimeStampedModel):

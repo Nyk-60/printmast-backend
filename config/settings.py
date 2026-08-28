@@ -94,8 +94,33 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-MEDIA_URL = 'media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+# ── File storage (Cloudflare R2 when configured, local disk in dev) ───────────
+
+_R2_KEY = env('R2_ACCESS_KEY_ID', default='')
+
+if _R2_KEY:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'storages.backends.s3boto3.S3Boto3Storage',
+            'OPTIONS': {
+                'access_key':       _R2_KEY,
+                'secret_key':       env('R2_SECRET_ACCESS_KEY'),
+                'bucket_name':      env('R2_BUCKET_NAME', default='fulfillment'),
+                'endpoint_url':     env('R2_ENDPOINT_URL'),
+                'region_name':      'auto',
+                'querystring_auth': True,   # presigned URLs — no public bucket needed
+                'querystring_expire': 86400,  # 24 h
+                'file_overwrite':   False,
+            },
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+    MEDIA_URL = ''   # URLs are absolute presigned; MEDIA_URL prefix not used
+else:
+    MEDIA_URL  = '/media/'
+    MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -136,13 +161,18 @@ FIELD_ENCRYPTION_KEY = env('FIELD_ENCRYPTION_KEY', default='')
 
 # ShipStation (legacy global key — per-account keys stored in DB)
 SHIPSTATION_BASE_URL = env('SHIPSTATION_BASE_URL', default='https://api.shipstation.com')
+# Public URL used to build ShipStation webhook callback URLs
+SITE_URL = env('SITE_URL', default='http://localhost:8000')
 
 # Celery
 CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+CELERY_TIMEZONE = 'UTC'
 CELERY_BEAT_SCHEDULE = {
+    # Primary: ShipStation webhook handles real-time updates.
+    # This periodic task is the fallback — catches anything the webhook missed.
     'sync-all-shipstation-accounts': {
         'task': 'apps.shipping.tasks.sync_all_active_accounts',
-        'schedule': 900,  # every 15 minutes (fallback if webhook missed)
+        'schedule': 600,  # every 10 minutes
     },
 }

@@ -57,7 +57,8 @@ def _run_batch(batch):
         .select_related('order__store__shipstation_account',
                         'order__sub_user')
         .prefetch_related('order__items__designs',
-                          'order__items__pc_variant__pc_product__print_areas')
+                          'order__items__pc_variant__pc_product__print_areas',
+                          'order__items__pc_variant__dimension_rules')
         .order_by('sequence_number')
     )
 
@@ -115,8 +116,20 @@ def _run_batch(batch):
         if not order.selected_carrier_code:
             continue
         try:
-            from apps.shipping.client import ShipStationClient
+            from django.utils import timezone as tz
+            from apps.shipping.client import ShipStationClient, ShipStationError
+            from apps.shipping.utils import get_order_shipping_config
             client = ShipStationClient(order.store.shipstation_account)
+
+            # Refresh shipFrom/weight/dims right before label purchase so the
+            # label uses the print center's current sender address and the
+            # matched product's weight/dimensions.
+            try:
+                weight_oz, dimensions = get_order_shipping_config(order)
+                client.update_order_shipping_config(order, weight_oz=weight_oz, dimensions=dimensions)
+            except ShipStationError as exc:
+                logger.warning('Pre-label shipping config push failed for order %s: %s', order.id, exc)
+
             result = client.create_label(
                 shipstation_order_id=order.shipstation_order_id,
                 carrier_code=order.selected_carrier_code,
@@ -127,8 +140,9 @@ def _run_batch(batch):
             order.shipstation_shipment_id = str(result.get('shipmentId', ''))
             order.label_cost = result.get('shipmentCost')
             order.label_url = result.get('labelDownload', {}).get('href', '')
+            order.labeled_at = tz.now()
             order.save(update_fields=[
-                'tracking_number', 'shipstation_shipment_id', 'label_cost', 'label_url'
+                'tracking_number', 'shipstation_shipment_id', 'label_cost', 'label_url', 'labeled_at'
             ])
 
             bo.label_purchased = True

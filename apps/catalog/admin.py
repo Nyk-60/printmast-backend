@@ -10,7 +10,9 @@ from .models import (
     Product,
     ProductImage,
     ProductVariant,
+    VariantDimensionRule,
 )
+# Note: ProductVariationType removed from catalog in favor of variant-level fields
 
 
 class ProductImageInline(admin.TabularInline):
@@ -42,10 +44,19 @@ admin.site.register(Brand)
 admin.site.register(Category)
 
 
+class VariantDimensionRuleInline(admin.TabularInline):
+    model = VariantDimensionRule
+    extra = 0
+    fields = ('qty_min', 'qty_max', 'length_in', 'width_in', 'height_in')
+
+
 class PrintCenterVariantInline(admin.TabularInline):
     model = PrintCenterVariant
     extra = 0
-    fields = ('color', 'size', 'cost', 'weight_oz', 'is_dark', 'is_active')
+    fields = (
+        'color', 'size', 'cost', 'weight_oz', 'is_dark', 'is_active',
+        'dim_length_in', 'dim_width_in', 'dim_height_base_in', 'dim_height_per_unit_in', 'dim_height_step', 'is_stackable',
+    )
 
 
 class PrintCenterPrintAreaInline(admin.TabularInline):

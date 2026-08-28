@@ -58,13 +58,27 @@ class Order(TimeStampedModel):
     tracking_number = models.CharField(max_length=120, blank=True)
     shipstation_shipment_id = models.CharField(max_length=64, blank=True)
     label_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    labeled_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Shipping override (PC-only: overrides auto-calculated weight/dims before ShipStation push)
+    shipping_override = models.JSONField(
+        null=True, blank=True,
+        help_text='PC-set override: {weight_oz, length, width, height, note}. Null = use auto-calc.',
+    )
 
     # Notes
-    buyer_note = models.TextField(blank=True)
-    print_note = models.TextField(blank=True)
+    buyer_note    = models.TextField(blank=True)
+    gift_message  = models.TextField(blank=True)
+    is_gift       = models.BooleanField(default=False)
+    internal_note = models.TextField(blank=True)
+    print_note    = models.TextField(blank=True)
 
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.NEW, db_index=True
+    )
+    is_hidden = models.BooleanField(
+        default=False, db_index=True,
+        help_text='Removed from platform view by the sub-user. Not cancelled in ShipStation.',
     )
 
     class Meta:
@@ -85,6 +99,7 @@ class OrderItem(TimeStampedModel):
     raw_options = models.JSONField(default=dict, blank=True)  # {"Size": "XL", "Color": "Black"}
     personalization = models.TextField(blank=True)
     image_url = models.URLField(blank=True)
+    custom_image = models.ImageField(upload_to='order_item_images/', blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 

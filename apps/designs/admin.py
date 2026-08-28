@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import ColorCategoryList, OrderItemDesign, SkuDesign
+from .models import OrderItemDesign, SkuDesign
 
 
 @admin.register(SkuDesign)
@@ -14,11 +14,3 @@ class SkuDesignAdmin(admin.ModelAdmin):
 class OrderItemDesignAdmin(admin.ModelAdmin):
     list_display = ('order_item', 'print_area_name', 'file_name', 'sku_design')
     search_fields = ('order_item__order__shipstation_order_number',)
-
-
-@admin.register(ColorCategoryList)
-class ColorCategoryListAdmin(admin.ModelAdmin):
-    list_display = ('sub_user', 'category', 'color_count')
-
-    def color_count(self, obj):
-        return len(obj.colors)

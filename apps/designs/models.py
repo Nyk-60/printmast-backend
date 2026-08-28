@@ -3,26 +3,42 @@ from django.db import models
 from apps.core.models import TimeStampedModel
 
 
-class ColorCategoryList(TimeStampedModel):
+class SubUserProductColorSetting(TimeStampedModel):
     """
-    Sub-user's custom dark/light color categorization.
-    Overrides the default is_dark flag on PrintCenterVariant.
+    Per-product color classification preference for a sub-user.
+    When use_custom=True, entries override the print center's is_dark flag.
+    When use_custom=False, the print center's is_dark flag is used directly
+    (bypassing the global ColorCategoryList for this product).
+    If no record exists, falls back to the global ColorCategoryList.
     """
-    class Category(models.TextChoices):
-        DARK = 'dark', 'Dark'
-        LIGHT = 'light', 'Light'
-
-    sub_user = models.ForeignKey(
-        'accounts.SubUserProfile', related_name='color_categories', on_delete=models.CASCADE
+    sub_user   = models.ForeignKey(
+        'accounts.SubUserProfile', related_name='product_color_settings', on_delete=models.CASCADE
     )
-    category = models.CharField(max_length=5, choices=Category.choices)
-    colors = models.JSONField(default=list)  # ["Military Green", "Black", ...]
+    pc_product = models.ForeignKey(
+        'catalog.PrintCenterProduct', related_name='sub_user_color_settings', on_delete=models.CASCADE
+    )
+    use_custom = models.BooleanField(default=False)
 
     class Meta:
-        unique_together = ('sub_user', 'category')
+        unique_together = ('sub_user', 'pc_product')
 
     def __str__(self):
-        return f'{self.sub_user} — {self.category} ({len(self.colors)} colors)'
+        return f'{self.sub_user} / {self.pc_product} — {"custom" if self.use_custom else "pc"}'
+
+
+class SubUserProductColorEntry(TimeStampedModel):
+    """One color → dark/light mapping for a SubUserProductColorSetting."""
+    setting    = models.ForeignKey(
+        SubUserProductColorSetting, related_name='entries', on_delete=models.CASCADE
+    )
+    color_name = models.CharField(max_length=100)
+    is_dark    = models.BooleanField()
+
+    class Meta:
+        unique_together = ('setting', 'color_name')
+
+    def __str__(self):
+        return f'{self.color_name} → {"dark" if self.is_dark else "light"}'
 
 
 class SkuDesign(TimeStampedModel):
@@ -43,13 +59,20 @@ class SkuDesign(TimeStampedModel):
     print_area_name = models.CharField(max_length=40)  # Front, Back, Left Sleeve…
     color_scope = models.CharField(max_length=8, choices=ColorScope.choices, default=ColorScope.ALL)
     specific_color = models.CharField(max_length=80, blank=True)  # only for SPECIFIC scope
+    personalization_match = models.CharField(
+        max_length=300, blank=True, default='',
+        help_text='Normalized personalization text required for this design to auto-match. '
+                  'Blank = matches items with no/empty personalization.',
+    )
     file = models.FileField(upload_to='designs/sku/')
     file_name = models.CharField(max_length=255, blank=True)
     width_px = models.PositiveIntegerField(default=0)
     height_px = models.PositiveIntegerField(default=0)
 
     class Meta:
-        unique_together = ('sub_user', 'sku', 'print_area_name', 'color_scope', 'specific_color')
+        unique_together = (
+            'sub_user', 'sku', 'print_area_name', 'color_scope', 'specific_color', 'personalization_match',
+        )
         indexes = [models.Index(fields=['sub_user', 'sku', 'print_area_name'])]
 
     def __str__(self):

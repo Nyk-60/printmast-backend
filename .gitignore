@@ -10,3 +10,9 @@ staticfiles/
 .idea/
 .vscode/
 *.log
+
+# Claude Code local tool state — contains local command allowlists (may include tokens from past sessions)
+.claude/
+
+# Superseded by apps/production/ (packing.py, gang_sheet.py) — kept locally for reference
+gang_pack_poc.py

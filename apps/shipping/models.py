@@ -55,6 +55,11 @@ class Store(TimeStampedModel):
         blank=True,
     )
 
+    # Seller-set sender info shown on shipping labels for this store
+    ship_from_name    = models.CharField(max_length=200, blank=True,
+        help_text='Sender name on labels for this store (e.g. "MyStore"). Falls back to PC company name.')
+    ship_from_company = models.CharField(max_length=200, blank=True)
+
     class Meta:
         unique_together = ('shipstation_account', 'shipstation_store_id')
 
@@ -64,3 +69,60 @@ class Store(TimeStampedModel):
     @property
     def print_center(self):
         return self.shipstation_account.print_center
+
+
+class ShippingServiceOption(TimeStampedModel):
+    """A carrier+service combo the print center offers, grouped into a category."""
+
+    class Category(models.TextChoices):
+        STANDARD = 'standard', 'Standard'
+        PRIORITY = 'priority', 'Priority'
+        EXPRESS = 'express', 'Express'
+
+    print_center = models.ForeignKey(
+        'accounts.PrintCenterProfile',
+        related_name='shipping_service_options',
+        on_delete=models.CASCADE,
+    )
+    category = models.CharField(max_length=10, choices=Category.choices)
+    carrier_code = models.CharField(max_length=80)
+    service_code = models.CharField(max_length=80)
+    service_name = models.CharField(max_length=120, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ('category', 'sort_order', 'id')
+        unique_together = ('print_center', 'category', 'carrier_code', 'service_code')
+
+    def __str__(self):
+        return f'{self.print_center.company_name} / {self.category} / {self.service_code}'
+
+
+class ShippingServiceDefault(TimeStampedModel):
+    """A sub-user's default service choice for a category.
+
+    Constrained to the print center's ShippingServiceOption entries —
+    sub-users cannot set arbitrary carrier/service codes.
+    """
+
+    sub_user = models.ForeignKey(
+        'accounts.SubUserProfile',
+        related_name='shipping_service_defaults',
+        on_delete=models.CASCADE,
+    )
+    category = models.CharField(max_length=10, choices=ShippingServiceOption.Category.choices)
+    service_option = models.ForeignKey(
+        ShippingServiceOption,
+        null=True, blank=True,
+        related_name='+',
+        on_delete=models.SET_NULL,
+        help_text="Null = use the cheapest of the print center's options for this category.",
+    )
+
+    class Meta:
+        unique_together = ('sub_user', 'category')
+
+    def __str__(self):
+        target = self.service_option.service_code if self.service_option else 'cheapest'
+        return f'{self.sub_user} / {self.category} -> {target}'

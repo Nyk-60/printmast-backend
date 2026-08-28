@@ -1,15 +1,18 @@
+from django.db.models import Min
 from rest_framework import serializers
 
 from .models import (
     Brand,
     Category,
     PrintArea,
+    PrintAreaSizeSpec,
     PrintCenterPrintArea,
     PrintCenterProduct,
     PrintCenterVariant,
     Product,
     ProductImage,
     ProductVariant,
+    VariantDimensionRule,
 )
 
 
@@ -42,43 +45,70 @@ class PrintAreaSerializer(serializers.ModelSerializer):
 
 
 class ProductVariantSerializer(serializers.ModelSerializer):
+    sku   = serializers.CharField(max_length=80, required=False, allow_blank=True, default='')
+    cost  = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, default=0)
+    price = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, default=0)
+
     class Meta:
         model = ProductVariant
-        fields = ('id', 'sku', 'color', 'color_hex', 'size', 'dimension', 'volume',
+        fields = ('id', 'sku', 'color', 'color_hex', 'color_group', 'size', 'dimension', 'volume',
                   'cost', 'price', 'is_dark', 'stock_status', 'weight_oz')
 
 
 class ProductListSerializer(serializers.ModelSerializer):
-    brand = serializers.CharField(source='brand.name')
-    category = serializers.CharField(source='category.slug')
+    brand          = serializers.CharField(source='brand.name')
+    category       = serializers.CharField(source='category.slug')
+    category_name  = serializers.CharField(source='category.name')
+    variant_count = serializers.IntegerField(source='variants.count', read_only=True)
+    size_count    = serializers.SerializerMethodField()
+    color_count   = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
-        fields = ('id', 'name', 'sku', 'brand', 'category', 'base_price', 'badge', 'primary_image')
+        fields = ('id', 'name', 'sku', 'brand', 'category', 'category_name', 'base_price', 'badge',
+                  'primary_image', 'variant_count', 'size_count', 'color_count',
+                  'variant1_label', 'variant2_label')
+
+    def get_size_count(self, obj):
+        return len({v.size for v in obj.variants.all() if v.size})
+
+    def get_color_count(self, obj):
+        return len({v.color for v in obj.variants.all() if v.color})
 
 
 class ProductDetailSerializer(serializers.ModelSerializer):
     brand = BrandSerializer(read_only=True)
     category = CategorySerializer(read_only=True)
     images = ProductImageSerializer(many=True, read_only=True)
-    variants = ProductVariantSerializer(many=True, read_only=True)
+    variants = serializers.SerializerMethodField()
     print_areas = PrintAreaSerializer(many=True, read_only=True)
 
     class Meta:
         model = Product
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
-            'base_cost', 'base_price', 'badge', 'is_active', 'primary_image',
+            'base_price', 'badge', 'is_active', 'primary_image',
+            'variant1_label', 'variant2_label',
             'images', 'variants', 'print_areas',
         )
 
+    def get_variants(self, obj):
+        from apps.core.utils import size_order_annotation
+        qs = obj.variants.annotate(size_ord=size_order_annotation()).order_by('size_ord', 'color')
+        return ProductVariantSerializer(qs, many=True).data
+
 
 class ProductWriteSerializer(serializers.ModelSerializer):
+    sku           = serializers.CharField(max_length=64, required=False, allow_blank=True, default='')
+    base_price    = serializers.DecimalField(max_digits=10, decimal_places=2, required=False, default=0)
+    primary_image = serializers.ImageField(required=False, allow_null=True, allow_empty_file=False)
+
     class Meta:
         model = Product
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
-            'base_cost', 'base_price', 'badge', 'is_active', 'primary_image',
+            'base_price', 'badge', 'is_active', 'primary_image',
+            'variant1_label', 'variant2_label',
         )
 
 
@@ -87,27 +117,62 @@ class ProductWriteSerializer(serializers.ModelSerializer):
 class PrintCenterPrintAreaSerializer(serializers.ModelSerializer):
     class Meta:
         model = PrintCenterPrintArea
-        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches')
+        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon')
+
+
+class PrintAreaSizeSpecSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PrintAreaSizeSpec
+        fields = ('id', 'print_area', 'size', 'max_dim_in')
+
+
+class VariantDimensionRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VariantDimensionRule
+        fields = ('id', 'qty_min', 'qty_max', 'length_in', 'width_in', 'height_in')
 
 
 class PrintCenterVariantSerializer(serializers.ModelSerializer):
+    dimension_rules = VariantDimensionRuleSerializer(many=True, read_only=True)
+
     class Meta:
         model = PrintCenterVariant
-        fields = ('id', 'color', 'color_hex', 'size', 'is_dark', 'is_active', 'cost', 'weight_oz')
+        fields = (
+            'id', 'color', 'color_hex', 'color_group', 'size', 'is_dark', 'is_active', 'cost', 'weight_oz',
+            'dim_length_in', 'dim_width_in', 'dim_height_base_in',
+            'dim_height_per_unit_in', 'dim_height_step', 'is_stackable',
+            'dimension_rules',
+        )
 
 
 class PrintCenterProductListSerializer(serializers.ModelSerializer):
-    brand = serializers.CharField(source='brand.name', default=None)
-    category = serializers.CharField(source='category.slug', default=None)
+    brand          = serializers.CharField(source='brand.name', default=None)
+    category       = serializers.CharField(source='category.slug', default=None)
+    category_name  = serializers.CharField(source='category.name', default=None)
     variant_count = serializers.IntegerField(source='variants.count', read_only=True)
+    min_price     = serializers.SerializerMethodField()
+    size_count    = serializers.SerializerMethodField()
+    color_count   = serializers.SerializerMethodField()
 
     class Meta:
         model = PrintCenterProduct
-        fields = ('id', 'name', 'sku', 'brand', 'category', 'badge', 'is_active', 'primary_image', 'variant_count')
+        fields = ('id', 'name', 'sku', 'brand', 'category', 'category_name', 'badge', 'is_active',
+                  'primary_image', 'variant_count', 'min_price', 'size_count', 'color_count',
+                  'variant1_label', 'variant2_label')
+
+    def get_min_price(self, obj):
+        agg = obj.variants.filter(is_active=True).aggregate(m=Min('cost'))
+        return agg['m']
+
+    def get_size_count(self, obj):
+        return len({v.size for v in obj.variants.all() if v.is_active and v.size})
+
+    def get_color_count(self, obj):
+        return len({v.color for v in obj.variants.all() if v.is_active and v.color})
 
 
 class PrintCenterProductDetailSerializer(serializers.ModelSerializer):
-    variants = PrintCenterVariantSerializer(many=True, read_only=True)
+    variants = serializers.SerializerMethodField()
     print_areas = PrintCenterPrintAreaSerializer(many=True, read_only=True)
     brand = BrandSerializer(read_only=True)
     category = CategorySerializer(read_only=True)
@@ -118,23 +183,26 @@ class PrintCenterProductDetailSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
             'badge', 'is_active', 'primary_image', 'source_product_id',
+            'variant1_label', 'variant2_label',
             'variants', 'print_areas',
         )
 
+    def get_variants(self, obj):
+        from apps.core.utils import size_order_annotation
+        qs = obj.variants.all()
+        if not self.context.get('include_inactive'):
+            qs = qs.filter(is_active=True)
+        qs = qs.annotate(size_ord=size_order_annotation()).order_by('size_ord', 'color')
+        return PrintCenterVariantSerializer(qs, many=True).data
+
 
 class PrintCenterProductWriteSerializer(serializers.ModelSerializer):
+    primary_image = serializers.ImageField(required=False, allow_null=True, allow_empty_file=False)
+
     class Meta:
         model = PrintCenterProduct
-        fields = ('name', 'sku', 'description', 'brand', 'category', 'badge', 'is_active', 'primary_image')
-
-    def validate_sku(self, value):
-        print_center = self.context['print_center']
-        qs = PrintCenterProduct.objects.filter(print_center=print_center, sku=value)
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-        if qs.exists():
-            raise serializers.ValidationError('SKU already exists in your catalog')
-        return value
+        fields = ('name', 'sku', 'description', 'brand', 'category', 'badge',
+                  'is_active', 'primary_image', 'variant1_label', 'variant2_label')
 
     def create(self, validated_data):
         return PrintCenterProduct.objects.create(
@@ -143,18 +211,21 @@ class PrintCenterProductWriteSerializer(serializers.ModelSerializer):
         )
 
 
+class AdoptVariantOverrideSerializer(serializers.Serializer):
+    """Per-variant data when adopting a platform product."""
+    id         = serializers.IntegerField(required=False)  # existing platform variant ID
+    size       = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    color      = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    cost       = serializers.DecimalField(max_digits=10, decimal_places=2, default=0)
+    weight_oz  = serializers.DecimalField(max_digits=8, decimal_places=2, required=False, allow_null=True, default=None)
+    is_dark    = serializers.BooleanField(required=False, default=False)
+
+
 class AdoptProductSerializer(serializers.Serializer):
     """Adopt a platform product into the print center's catalog."""
-    sku = serializers.CharField(max_length=64, required=False)
-    variant_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False,
-        help_text='Subset of variant IDs to include. Empty = all active variants.',
-    )
-    print_area_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False,
-        help_text='Subset of print area IDs to include. Empty = all.',
-    )
-    cost_markup_percent = serializers.DecimalField(
-        max_digits=6, decimal_places=2, default=0,
-        help_text='Percentage markup over base_cost for initial variant pricing.',
-    )
+    sku            = serializers.CharField(max_length=64, required=False)
+    variants       = AdoptVariantOverrideSerializer(many=True, required=False)
+    print_area_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
+    # Legacy fields kept for backwards compatibility
+    variant_ids        = serializers.ListField(child=serializers.IntegerField(), required=False)
+    cost_markup_percent = serializers.DecimalField(max_digits=6, decimal_places=2, default=0, required=False)

@@ -8,7 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsPrintCenter
-from apps.designs.models import OrderItemDesign
+from apps.designs.models import OrderItemDesign, SkuDesign
 from apps.designs.serializers import OrderItemDesignSerializer
 
 from .models import Order, OrderItem, ProductMapping
@@ -18,11 +18,14 @@ from .serializers import (
     OrderDetailSerializer,
     OrderListSerializer,
     ProductMappingSerializer,
+    ShippingOverrideSerializer,
 )
 from .services import (
     auto_match_design,
     auto_match_order,
+    order_is_matched,
     parse_mapping_excel,
+    refresh_order_status,
 )
 
 
@@ -34,26 +37,85 @@ def _get_sub_user(request):
 
 class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = (IsAuthenticated,)
-    filterset_fields = ('status', 'store')
-    search_fields = ('shipstation_order_number', 'customer_name', 'external_order_number')
+    filterset_fields = ('status', 'store', 'sub_user')
+    search_fields = (
+        'shipstation_order_number', 'customer_name', 'external_order_number', 'ship_to_name',
+        'items__marketplace_sku', 'items__raw_product_name',
+        'items__pc_variant__pc_product__name', 'items__pc_variant__pc_product__brand__name',
+        'items__pc_variant__size', 'items__pc_variant__color',
+    )
+
+    NEW_ORDER_STATUSES       = ('new', 'matching', 'ready')
+    READY_FOR_PRINT_STATUSES = ('sent_to_print',)
+    IN_PRODUCTION_STATUSES   = ('in_production',)
+    ACTIVE_STATUSES          = ('new', 'matching', 'ready', 'sent_to_print', 'in_production')
+    COMPLETED_STATUSES       = ('shipped', 'delivered', 'cancelled', 'refunded')
 
     def get_queryset(self):
-        user = self.request.user
+        from django.db.models import Count, Exists, OuterRef, Q
+        from apps.designs.models import OrderItemDesign
+
+        user   = self.request.user
+        params = self.request.query_params
+        tab    = params.get('tab', '')
+
         if user.is_sub_user:
-            return (
-                Order.objects.filter(sub_user=user.sub_user_profile)
-                .select_related('store')
-                .prefetch_related('items__designs', 'items__pc_variant')
+            qs = (
+                Order.objects.filter(sub_user=user.sub_user_profile, is_hidden=False)
+                .select_related('store__shipstation_account__print_center', 'sub_user__user')
+                .prefetch_related('items__pc_variant__pc_product')
             )
-        if user.is_print_center:
-            return (
+        elif user.is_print_center:
+            qs = (
                 Order.objects.filter(
-                    store__shipstation_account__print_center=user.print_center_profile
+                    store__shipstation_account__print_center=user.print_center_profile,
+                    is_hidden=False,
                 )
                 .select_related('store', 'sub_user__user')
-                .prefetch_related('items')
+                .prefetch_related('items__pc_variant__pc_product')
             )
-        return Order.objects.none()
+        else:
+            return Order.objects.none()
+
+        # Tab filtering (new_orders / ready_for_print / in_production / completed; 'active' = backward compat)
+        if tab in ('new_orders', 'active'):
+            qs = qs.filter(status__in=self.NEW_ORDER_STATUSES)
+        elif tab == 'ready_for_print':
+            qs = qs.filter(status__in=self.READY_FOR_PRINT_STATUSES)
+        elif tab == 'in_production':
+            qs = qs.filter(status__in=self.IN_PRODUCTION_STATUSES)
+        elif tab == 'completed':
+            qs = qs.filter(status__in=self.COMPLETED_STATUSES)
+
+        # Always annotate has_design for serializer + optional filter
+        qs = qs.annotate(
+            _has_design=Exists(
+                OrderItemDesign.objects.filter(order_item__order=OuterRef('pk'))
+            )
+        )
+
+        # matched=true → all billable items matched; matched=false → has unmatched
+        matched_p = params.get('matched', '')
+        if matched_p in ('true', 'false'):
+            qs = qs.annotate(
+                _unmatched=Count(
+                    'items',
+                    filter=Q(items__pc_variant__isnull=True, items__unit_price__gte=0),
+                )
+            )
+            if matched_p == 'true':
+                qs = qs.filter(_unmatched=0)
+            else:
+                qs = qs.filter(_unmatched__gt=0)
+
+        # has_design=true/false filter
+        has_design_p = params.get('has_design', '')
+        if has_design_p == 'true':
+            qs = qs.filter(_has_design=True)
+        elif has_design_p == 'false':
+            qs = qs.filter(_has_design=False)
+
+        return qs
 
     def get_serializer_class(self):
         return OrderListSerializer if self.action == 'list' else OrderDetailSerializer
@@ -67,6 +129,19 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         serializer = AddressUpdateSerializer(order, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+
+        # Push updated address to ShipStation in a background thread (non-blocking)
+        import threading
+        def _push():
+            try:
+                from django.db import close_old_connections
+                close_old_connections()
+                from apps.shipping.tasks import push_address_to_shipstation
+                push_address_to_shipstation(order.pk)
+            except Exception:
+                pass
+        threading.Thread(target=_push, daemon=True).start()
+
         return Response(OrderDetailSerializer(order).data)
 
     # ── Product match ─────────────────────────────────────────────────────────
@@ -90,11 +165,12 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             item.save(update_fields=['pc_variant', 'matched_at'])
 
             if entry.get('remember'):
+                from .services import _variant_key
                 ProductMapping.objects.update_or_create(
                     sub_user=request.user.sub_user_profile,
                     store=order.store,
                     marketplace_sku=item.marketplace_sku,
-                    marketplace_variant=str(item.raw_options),
+                    marketplace_variant=_variant_key(item.raw_options or {}),
                     defaults={'pc_variant_id': entry['pc_variant_id']},
                 )
 
@@ -111,9 +187,53 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
         matched = auto_match_order(order)
+        self._refresh_order_status(order)
         return Response({'matched': matched})
 
     # ── Design upload ─────────────────────────────────────────────────────────
+
+    @action(detail=True, methods=['patch'], url_path='items/(?P<item_pk>[0-9]+)/personalization')
+    def update_personalization(self, request, pk=None, item_pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        try:
+            item = order.items.get(pk=item_pk)
+        except OrderItem.DoesNotExist:
+            raise NotFound()
+        item.personalization = request.data.get('personalization', '')
+        item.save(update_fields=['personalization'])
+
+        import threading
+        def _push():
+            try:
+                from django.db import close_old_connections
+                close_old_connections()
+                from apps.shipping.tasks import push_personalization_to_shipstation
+                push_personalization_to_shipstation(order.pk, item.pk)
+            except Exception:
+                pass
+        threading.Thread(target=_push, daemon=True).start()
+
+        return Response({'personalization': item.personalization})
+
+    @action(detail=True, methods=['post'], url_path='items/(?P<item_pk>[0-9]+)/image',
+            parser_classes=[__import__('rest_framework.parsers', fromlist=['MultiPartParser']).MultiPartParser])
+    def upload_item_image(self, request, pk=None, item_pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        try:
+            item = order.items.get(pk=item_pk)
+        except OrderItem.DoesNotExist:
+            raise NotFound()
+        image = request.FILES.get('image')
+        if not image:
+            return Response({'detail': 'No image provided'}, status=400)
+        if item.custom_image:
+            item.custom_image.delete(save=False)
+        item.custom_image = image
+        item.save(update_fields=['custom_image'])
+        from .serializers import OrderItemPreviewSerializer
+        return Response(OrderItemPreviewSerializer(item, context={'request': request}).data)
 
     @action(detail=True, methods=['post'], url_path='items/(?P<item_pk>[0-9]+)/design')
     def upload_design(self, request, pk=None, item_pk=None):
@@ -126,11 +246,25 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         serializer = OrderItemDesignSerializer(
             data=request.data,
-            context={'order_item': item},
+            context={'order_item': item, 'sub_user': request.user.sub_user_profile, 'request': request},
         )
         serializer.is_valid(raise_exception=True)
         design = serializer.save()
-        return Response(OrderItemDesignSerializer(design).data, status=status.HTTP_201_CREATED)
+        self._refresh_order_status(order)
+        resp = OrderItemDesignSerializer(design, context={'request': request}).data
+        # When the upload scope doesn't match the item's color (e.g., dark on a white shirt),
+        # the OID isn't updated so its sku_design still points to the previous matched design.
+        # Override response fields with the SkuDesign that was actually saved so the frontend
+        # can add a correct separate card for it.
+        saved_sd = serializer.context.get('saved_sku_design')
+        if saved_sd:
+            resp['sku_design'] = saved_sd.pk
+            resp['color_scope'] = saved_sd.color_scope
+            resp['specific_color'] = saved_sd.specific_color
+            resp['file_name'] = saved_sd.file_name
+            if saved_sd.file:
+                resp['file'] = request.build_absolute_uri(saved_sd.file.url)
+        return Response(resp, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='items/(?P<item_pk>[0-9]+)/designs')
     def list_designs(self, request, pk=None, item_pk=None):
@@ -141,7 +275,47 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         except OrderItem.DoesNotExist:
             raise NotFound()
         designs = OrderItemDesign.objects.filter(order_item=item)
-        return Response(OrderItemDesignSerializer(designs, many=True).data)
+        return Response(OrderItemDesignSerializer(designs, many=True, context={'request': request}).data)
+
+    @action(detail=True, methods=['delete'], url_path='items/(?P<item_pk>[0-9]+)/design/(?P<design_pk>[0-9]+)')
+    def delete_design(self, request, pk=None, item_pk=None, design_pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        try:
+            item = order.items.get(pk=item_pk)
+        except OrderItem.DoesNotExist:
+            raise NotFound()
+        try:
+            design = OrderItemDesign.objects.get(pk=design_pk, order_item=item)
+        except OrderItemDesign.DoesNotExist:
+            raise NotFound()
+
+        if design.file:
+            design.file.delete(save=False)
+        design.delete()
+        self._refresh_order_status(order)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['delete'], url_path='items/(?P<item_pk>[0-9]+)/library-design/(?P<sku_design_pk>[0-9]+)')
+    def delete_library_design(self, request, pk=None, item_pk=None, sku_design_pk=None):
+        """Delete a SkuDesign (library entry) and its associated OrderItemDesigns in this order."""
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        sub_user = request.user.sub_user_profile
+        try:
+            sku_design = SkuDesign.objects.get(pk=sku_design_pk, sub_user=sub_user)
+        except SkuDesign.DoesNotExist:
+            raise NotFound()
+
+        # Remove any OrderItemDesign in this order that was linked to this SkuDesign
+        OrderItemDesign.objects.filter(sku_design=sku_design, order_item__order=order).delete()
+
+        if sku_design.file:
+            sku_design.file.delete(save=False)
+        sku_design.delete()
+
+        self._refresh_order_status(order)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     # ── Shipping ──────────────────────────────────────────────────────────────
 
@@ -172,8 +346,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
 
-        if order.status not in (Order.Status.READY, Order.Status.MATCHING):
-            return Response({'detail': 'All items must be matched before sending to print'}, status=400)
+        if order.status != Order.Status.READY:
+            return Response({'detail': 'Order must be matched and have a design before sending to print'}, status=400)
 
         if not order.selected_carrier_code:
             return Response({'detail': 'Please select a shipping method first'}, status=400)
@@ -203,6 +377,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         order.status = Order.Status.SENT_TO_PRINT
         order.save(update_fields=['status'])
+
         return Response(OrderDetailSerializer(order).data)
 
     # ── Cancel ────────────────────────────────────────────────────────────────
@@ -217,16 +392,134 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         order.save(update_fields=['status'])
         return Response(OrderDetailSerializer(order).data)
 
+    # ── Hide (remove from platform) ───────────────────────────────────────────
+
+    @action(detail=True, methods=['post'], url_path='hide')
+    def hide(self, request, pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        order.is_hidden = True
+        order.save(update_fields=['is_hidden'])
+        return Response({'detail': 'Order removed from platform.'})
+
+    # ── PC: shipping override ─────────────────────────────────────────────────
+
+    @action(detail=True, methods=['patch'], url_path='shipping-override',
+            permission_classes=[IsPrintCenter])
+    def shipping_override(self, request, pk=None):
+        order = self.get_object()
+        pc = request.user.print_center_profile
+        if order.store.shipstation_account.print_center_id != pc.pk:
+            raise PermissionDenied()
+
+        ser = ShippingOverrideSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        if data.get('clear'):
+            order.shipping_override = None
+        else:
+            override = {}
+            if data.get('weight_oz') is not None:
+                override['weight_oz'] = float(data['weight_oz'])
+            if all(data.get(k) is not None for k in ('length', 'width', 'height')):
+                override['length'] = float(data['length'])
+                override['width']  = float(data['width'])
+                override['height'] = float(data['height'])
+            if data.get('note') is not None:
+                override['note'] = data['note']
+            order.shipping_override = override or None
+
+        order.save(update_fields=['shipping_override'])
+        return Response(OrderDetailSerializer(order).data)
+
+    @action(detail=True, methods=['patch'], url_path='gift')
+    def update_gift(self, request, pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+        if 'is_gift' in request.data:
+            order.is_gift = bool(request.data['is_gift'])
+        if 'gift_message' in request.data:
+            order.gift_message = request.data['gift_message'] or ''
+        order.save(update_fields=['is_gift', 'gift_message'])
+        return Response({'is_gift': order.is_gift, 'gift_message': order.gift_message})
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _assert_sub_user_owns(self, request, order):
-        if request.user.is_sub_user and order.sub_user != request.user.sub_user_profile:
-            raise PermissionDenied()
+        sub = getattr(request.user, 'sub_user_profile', None)
+        if not sub:
+            raise PermissionDenied('Sub-user access only.')
 
     def _refresh_order_status(self, order):
-        if not order.items.filter(pc_variant__isnull=True).exists():
-            order.status = Order.Status.READY
-            order.save(update_fields=['status'])
+        refresh_order_status(order)
+        if order_is_matched(order):
+            import logging
+            import threading
+            _log = logging.getLogger(__name__)
+            def _push():
+                from django.db import close_old_connections
+                close_old_connections()
+                from apps.shipping.tasks import (
+                    push_order_shipping_to_shipstation,
+                    refresh_shipping_rate_for_order,
+                )
+                try:
+                    push_order_shipping_to_shipstation(order.pk)
+                except Exception as exc:
+                    _log.exception('ShipStation shipping push FAILED for order %s: %s', order.pk, exc)
+                try:
+                    refresh_shipping_rate_for_order(order.pk)
+                except Exception as exc:
+                    _log.exception('ShipStation rate refresh FAILED for order %s: %s', order.pk, exc)
+            threading.Thread(target=_push, daemon=True).start()
+
+
+# ── Bulk auto-match ───────────────────────────────────────────────────────────
+
+class AutoMatchAllView(APIView):
+    """Apply auto product-matching to every unmatched order for the authenticated sub-user."""
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        sub_user = _get_sub_user(request)
+        if not sub_user:
+            raise PermissionDenied('Sub-user access only.')
+
+        unmatched_orders = (
+            Order.objects.filter(sub_user=sub_user, is_hidden=False)
+            .filter(status__in=[Order.Status.NEW, Order.Status.MATCHING, Order.Status.READY])
+            .filter(items__pc_variant__isnull=True, items__unit_price__gte=0)
+            .distinct()
+        )
+        total_matched = 0
+        for order in unmatched_orders:
+            matched = auto_match_order(order)
+            total_matched += matched
+            if matched:
+                self._push_shipping(order)
+        return Response({'matched': total_matched})
+
+    def _push_shipping(self, order):
+        if not order_is_matched(order):
+            return
+        import threading
+        def _push():
+            from django.db import close_old_connections
+            close_old_connections()
+            from apps.shipping.tasks import (
+                push_order_shipping_to_shipstation,
+                refresh_shipping_rate_for_order,
+            )
+            try:
+                push_order_shipping_to_shipstation(order.pk)
+            except Exception:
+                pass
+            try:
+                refresh_shipping_rate_for_order(order.pk)
+            except Exception:
+                pass
+        threading.Thread(target=_push, daemon=True).start()
 
 
 # ── Product Mappings ──────────────────────────────────────────────────────────
@@ -254,6 +547,113 @@ class ProductMappingDeleteView(generics.DestroyAPIView):
             raise NotFound()
 
 
+class MappingTemplateView(APIView):
+    """Download a blank Excel template for product mappings."""
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        import io
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from django.http import HttpResponse
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Mappings'
+
+        mkt_fill  = PatternFill(fill_type='solid', fgColor='DBEAFE')
+        cat_fill  = PatternFill(fill_type='solid', fgColor='DCFCE7')
+        bold      = Font(bold=True)
+        gray_italic = Font(italic=True, color='999999')
+
+        headers = ['Catalog Product', 'Catalog Size', 'Catalog Color',
+                   'Option 1 Name', 'Option 1 Value', 'Option 2 Name', 'Option 2 Value']
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font = bold
+            cell.fill = cat_fill if col <= 3 else mkt_fill
+            cell.alignment = Alignment(horizontal='center')
+
+        examples = [
+            ['Comfort Colors 1717 Unisex Shirt', 'M', 'Sea Foam', 'Item & Size', 'Unisex T-Shirt - M', 'Clothing Color', 'Sea Foam'],
+            ['Comfort Colors 1717 Unisex Shirt', 'M', 'Black',    'Item & Size', 'Unisex T-Shirt - M', 'Clothing Color', 'Black'],
+            ['Classic Mug 11oz',                 '11oz', 'White', 'Style',       'Classic Mug',        '',               ''],
+        ]
+        for r, ex in enumerate(examples, 2):
+            for col, val in enumerate(ex, 1):
+                cell = ws.cell(row=r, column=col, value=val)
+                cell.font = gray_italic
+
+        for col, w in enumerate([36, 12, 24, 18, 28, 18, 28], 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        resp = HttpResponse(
+            buf.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        resp['Content-Disposition'] = 'attachment; filename="mapping_template.xlsx"'
+        return resp
+
+
+class MappingGenerateTemplateView(APIView):
+    """Generate a mapping template pre-filled from the sub-user's unmatched orders."""
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        import io
+        from django.http import HttpResponse
+        from .services import generate_mapping_template
+
+        sub_user = _get_sub_user(request)
+        wb = generate_mapping_template(sub_user)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        resp = HttpResponse(
+            buf.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        resp['Content-Disposition'] = 'attachment; filename="mapping_template_orders.xlsx"'
+        return resp
+
+
+class MappingExportView(APIView):
+    """Export all saved ProductMappings as a fully pre-filled Excel file."""
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        import io
+        from django.http import HttpResponse
+        from .services import export_saved_mappings
+
+        sub_user = _get_sub_user(request)
+        wb = export_saved_mappings(sub_user)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        resp = HttpResponse(
+            buf.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        resp['Content-Disposition'] = 'attachment; filename="saved_mappings.xlsx"'
+        return resp
+
+
+class MappingCountView(APIView):
+    """Return the count of saved ProductMappings for the authenticated sub-user."""
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        sub_user = _get_sub_user(request)
+        count = ProductMapping.objects.filter(sub_user=sub_user).count()
+        return Response({'count': count})
+
+
 class MappingUploadView(APIView):
     """Upload an Excel file to bulk-create/update ProductMappings."""
     permission_classes = (IsAuthenticated,)
@@ -273,8 +673,28 @@ class MappingUploadView(APIView):
             except Store.DoesNotExist:
                 return Response({'detail': 'Store not found or not assigned to you'}, status=400)
 
-        saved, skipped, errors = parse_mapping_excel(file, sub_user, store=store)
-        return Response({'saved': saved, 'skipped': skipped, 'errors': errors[:20]})
+        created, updated, skipped, errors = parse_mapping_excel(file, sub_user, store=store)
+
+        # Auto-match all unmatched order items (optional, controlled by caller)
+        apply_to_orders = request.data.get('apply_to_orders', 'true').lower() not in ('false', '0', 'no')
+        auto_matched = 0
+        if apply_to_orders:
+            from .services import auto_match_order
+            unmatched_orders = (
+                Order.objects.filter(sub_user=sub_user, is_hidden=False)
+                .filter(status__in=[Order.Status.NEW, Order.Status.MATCHING, Order.Status.READY])
+                .filter(items__pc_variant__isnull=True)
+                .distinct()
+            )
+            auto_matched = sum(auto_match_order(o) for o in unmatched_orders)
+
+        return Response({
+            'created': created,
+            'updated': updated,
+            'skipped': skipped,
+            'errors':  errors[:20],
+            'auto_matched': auto_matched,
+        })
 
 
 # ── Print Center — production queue view ──────────────────────────────────────
