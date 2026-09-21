@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Order, OrderItem, ProductMapping
+from .models import Order, OrderEvent, OrderItem, ProductMapping
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -148,27 +148,22 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
 
 
 class OrderCostMixin:
-    """Shared cost-breakdown calculation for the order list and detail serializers."""
+    """Shared cost-breakdown calculation for the order list and detail serializers.
 
-    def _billable_items(self, obj):
-        return [i for i in obj.items.all() if i.pc_variant_id and float(i.unit_price) >= 0]
+    Delegates to services.calculate_order_cost — the same function used to
+    determine what's actually charged at send-to-print, so the displayed
+    breakdown can never drift from the real charge.
+    """
 
     def get_item_cost(self, obj):
-        total = sum(float(i.pc_variant.cost) * i.quantity for i in self._billable_items(obj))
-        return round(total, 2)
+        from .services import calculate_order_cost
+        item_cost, _, _, _ = calculate_order_cost(obj)
+        return item_cost
 
     def get_extra_print_area_fee(self, obj):
-        sub_user = obj.sub_user
-        if not sub_user or not sub_user.extra_print_area_enabled:
-            return 0
-        price = float(sub_user.extra_print_area_price or 0)
-        if price <= 0:
-            return 0
-        extra_units = 0
-        for item in self._billable_items(obj):
-            extra_designs = max(0, item.designs.count() - 1)
-            extra_units += extra_designs * item.quantity
-        return round(extra_units * price, 2)
+        from .services import calculate_order_cost
+        _, extra_fee, _, _ = calculate_order_cost(obj)
+        return extra_fee
 
 
 class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
@@ -191,7 +186,7 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
             'ship_to_name', 'ship_to_company',
             'ship_to_address1', 'ship_to_address2',
             'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country',
-            'address_verified',
+            'address_verified', 'address_status',
             'ship_by_date', 'ordered_at',
             'requested_service', 'shipping_cost', 'status',
             'selected_carrier_code', 'selected_service_code', 'selected_service_name',
@@ -288,7 +283,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             'ship_to_name', 'ship_to_company',
             'ship_to_address1', 'ship_to_address2',
             'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country',
-            'address_verified', 'ship_by_date', 'ordered_at',
+            'address_verified', 'address_status', 'ship_by_date', 'ordered_at',
             'requested_service', 'selected_carrier_code', 'selected_service_code',
             'shipping_cost', 'tracking_number', 'label_url',
             'buyer_note', 'print_note', 'status',
@@ -311,6 +306,40 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             }
         except Exception:
             return None
+
+
+class OrderEventSerializer(serializers.ModelSerializer):
+    event_type_display = serializers.CharField(source='get_event_type_display', read_only=True)
+    actor_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderEvent
+        fields = ('id', 'event_type', 'event_type_display', 'actor_name', 'description', 'metadata', 'created_at')
+
+    def get_actor_name(self, obj):
+        if not obj.actor_id:
+            return None
+        return obj.actor.full_name or obj.actor.email
+
+
+class OrderActivityLogSerializer(serializers.ModelSerializer):
+    """One search result row: order summary + its full event timeline."""
+    store_name    = serializers.CharField(source='store.name', read_only=True)
+    sub_user_name = serializers.SerializerMethodField()
+    events        = OrderEventSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Order
+        fields = (
+            'id', 'shipstation_order_number', 'external_order_number', 'customer_name',
+            'store_name', 'sub_user_name', 'tracking_number', 'status', 'events',
+        )
+
+    def get_sub_user_name(self, obj):
+        if not obj.sub_user_id:
+            return None
+        user = obj.sub_user.user
+        return user.full_name or user.email
 
 
 class AddressUpdateSerializer(serializers.ModelSerializer):

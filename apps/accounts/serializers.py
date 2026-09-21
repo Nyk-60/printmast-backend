@@ -69,6 +69,7 @@ class PrintCenterProfileSerializer(serializers.ModelSerializer):
             'ship_from_street1', 'ship_from_street2',
             'ship_from_city', 'ship_from_state',
             'ship_from_postal_code', 'ship_from_country',
+            'shipping_pricing_mode',
         )
         read_only_fields = (
             'id', 'email', 'full_name', 'status', 'sub_user_count',
@@ -100,7 +101,7 @@ class PrintCenterProfileSerializer(serializers.ModelSerializer):
 class CreatePrintCenterSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
-    full_name = serializers.CharField(max_length=120, required=False, default='')
+    full_name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
     company_name = serializers.CharField(max_length=200)
     timezone = serializers.CharField(max_length=64, default='UTC')
     monthly_fee = serializers.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -204,7 +205,7 @@ class RegisterPrintCenterSerializer(serializers.Serializer):
 class SubUserCreateSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True, min_length=8)
-    full_name = serializers.CharField(max_length=120, required=False, default='')
+    full_name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
 
     # Permissions
     can_edit_orders = serializers.BooleanField(default=True)
@@ -217,7 +218,6 @@ class SubUserCreateSerializer(serializers.Serializer):
 
     # Balance settings
     negative_balance_limit = serializers.DecimalField(max_digits=12, decimal_places=2, default=0)
-    credit_until = serializers.DateField(required=False, allow_null=True)
 
     # Shipping markup
     shipping_markup_type = serializers.ChoiceField(
@@ -251,7 +251,6 @@ class SubUserCreateSerializer(serializers.Serializer):
             print_center=print_center,
             created_by=self.context['request'].user,
             negative_balance_limit=validated_data['negative_balance_limit'],
-            credit_until=validated_data.get('credit_until'),
             shipping_markup_type=validated_data['shipping_markup_type'],
             shipping_markup_value=validated_data['shipping_markup_value'],
             extra_print_area_enabled=validated_data['extra_print_area_enabled'],
@@ -279,7 +278,7 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'user_id', 'email', 'full_name', 'is_active',
             'print_center_name', 'print_center_logo_url',
-            'balance', 'negative_balance_limit', 'credit_until',
+            'balance', 'negative_balance_limit',
             'shipping_markup_type', 'shipping_markup_value',
             'extra_print_area_enabled', 'extra_print_area_price',
             'can_edit_orders', 'can_upload_product_mapping', 'can_upload_designs',
@@ -308,7 +307,7 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
 
 class AddBalanceSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal('0.01'))
-    description = serializers.CharField(max_length=500, required=False, default='')
+    description = serializers.CharField(max_length=500, required=False, allow_blank=True, default='')
 
 
 class BalanceTransactionSerializer(serializers.ModelSerializer):

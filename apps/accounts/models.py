@@ -66,6 +66,10 @@ class PrintCenterProfile(TimeStampedModel):
         ACTIVE = 'active', 'Active'
         SUSPENDED = 'suspended', 'Suspended'
 
+    class ShippingPricingMode(models.TextChoices):
+        DYNAMIC = 'dynamic', 'Dynamic (live rate + markup)'
+        FIXED = 'fixed', 'Fixed (weight-based price table)'
+
     user = models.OneToOneField(
         User, on_delete=models.CASCADE, related_name='print_center_profile'
     )
@@ -85,6 +89,14 @@ class PrintCenterProfile(TimeStampedModel):
     ship_from_state      = models.CharField(max_length=80,  blank=True)
     ship_from_postal_code = models.CharField(max_length=20, blank=True)
     ship_from_country    = models.CharField(max_length=2,   blank=True, default='US')
+
+    # Sub-user-facing shipping price source: live cross-provider rate + markup,
+    # or a print-center-defined flat table by weight (see FixedShippingRate).
+    # Independent of which provider actually buys the label at production time —
+    # that comparison always runs to minimize real cost regardless of this mode.
+    shipping_pricing_mode = models.CharField(
+        max_length=10, choices=ShippingPricingMode.choices, default=ShippingPricingMode.DYNAMIC,
+    )
 
     def __str__(self):
         return self.company_name
@@ -200,9 +212,6 @@ class SubUserProfile(TimeStampedModel):
         return f"{self.user.email} ({self.print_center.company_name})"
 
     def can_afford(self, amount):
-        import datetime
-        if self.credit_until and self.credit_until >= datetime.date.today():
-            return True
         return (self.balance - amount) >= -abs(self.negative_balance_limit)
 
 
@@ -236,7 +245,13 @@ class BalanceTransaction(TimeStampedModel):
     item_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipping_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     description = models.TextField(blank=True)
-    order_reference = models.CharField(max_length=128, blank=True)  # ShipStation order ID; FK added later
+    order_reference = models.CharField(max_length=128, blank=True)  # ShipStation order ID (display only)
+    order = models.ForeignKey(
+        'orders.Order', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='balance_transactions',
+        help_text='Links a debit to the order it charged for, so a later recall/cancel '
+                  'can refund exactly the outstanding amount for that order.',
+    )
     created_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, related_name='balance_transactions'
     )

@@ -24,12 +24,14 @@ class Command(BaseCommand):
         dry_run = options['dry_run']
         store_id = options.get('store')
 
-        # Orders that are in terminal statuses but were never sent to print
-        # through this platform (selected_carrier_code is empty = platform never touched them)
+        # Orders that are in a terminal status but were never actually labeled
+        # through this platform — regardless of whether a carrier was selected
+        # or a design was uploaded — never went through our production pipeline
+        # and must not be tracked as ours.
         qs = Order.objects.filter(
-            status__in=('shipped', 'cancelled'),
+            status__in=('shipped', 'delivered', 'cancelled', 'refunded'),
             is_hidden=False,
-            selected_carrier_code='',
+            labeled_at__isnull=True,
         )
         if store_id:
             qs = qs.filter(store_id=store_id)

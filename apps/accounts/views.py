@@ -134,6 +134,12 @@ class PCShippingSettingsView(APIView):
             if field in request.data:
                 setattr(pc, field, request.data[field] or '')
                 update_fields.append(field)
+        if 'shipping_pricing_mode' in request.data:
+            mode = request.data['shipping_pricing_mode']
+            if mode not in dict(PrintCenterProfile.ShippingPricingMode.choices):
+                return Response({'detail': 'Invalid shipping_pricing_mode'}, status=400)
+            pc.shipping_pricing_mode = mode
+            update_fields.append('shipping_pricing_mode')
         if update_fields:
             pc.save(update_fields=update_fields)
         return Response(PrintCenterProfileSerializer(pc, context={'request': request}).data)

@@ -1,5 +1,92 @@
 """Order processing service functions."""
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.utils import timezone
+
+_CENTS = Decimal('0.01')
+
+
+def log_event(order, event_type, actor=None, description='', metadata=None):
+    """Append one audit-trail entry for an order. Never raises — a logging
+    failure must never break the operation it's describing."""
+    from .models import OrderEvent
+    try:
+        OrderEvent.objects.create(
+            order=order, event_type=event_type, actor=actor,
+            description=description, metadata=metadata,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception('Failed to log OrderEvent %s for order %s', event_type, order.pk)
+
+
+def billable_items(order):
+    """Order items that are matched and not a discount/adjustment line."""
+    return [i for i in order.items.all() if i.pc_variant_id and float(i.unit_price) >= 0]
+
+
+def calculate_order_cost(order):
+    """Single source of truth for what an order actually costs the sub-user.
+
+    Used both to display the cost breakdown and to charge the sub-user's
+    balance at send-to-print — the two must never drift apart, or the print
+    center ends up producing at less than cost (or for free).
+
+    Returns Decimal values: (item_cost, extra_print_area_fee, shipping_cost, total).
+    """
+    items = billable_items(order)
+
+    item_cost = sum((i.pc_variant.cost * i.quantity for i in items), Decimal('0'))
+    item_cost = item_cost.quantize(_CENTS, rounding=ROUND_HALF_UP)
+
+    extra_print_area_fee = Decimal('0')
+    sub_user = order.sub_user
+    if sub_user and sub_user.extra_print_area_enabled:
+        price = sub_user.extra_print_area_price or Decimal('0')
+        if price > 0:
+            extra_units = sum(max(0, i.designs.count() - 1) * i.quantity for i in items)
+            extra_print_area_fee = (extra_units * price).quantize(_CENTS, rounding=ROUND_HALF_UP)
+
+    shipping_cost = order.shipping_cost or Decimal('0')
+    total = (item_cost + extra_print_area_fee + shipping_cost).quantize(_CENTS, rounding=ROUND_HALF_UP)
+    return item_cost, extra_print_area_fee, shipping_cost, total
+
+
+def refund_order_debit(order, actor, description):
+    """Refund whatever net amount is currently charged for this order, if any.
+
+    Nets all past DEBIT transactions against this order against all past REFUNDs
+    for it, so repeated send-to-print / recall cycles always settle correctly
+    without over- or under-refunding. No-op (returns None) if nothing is owed
+    back. Locks and updates the sub_user's balance — call within a transaction.
+    """
+    from django.db.models import Sum
+
+    from apps.accounts.models import BalanceTransaction
+
+    sub_user = type(order.sub_user).objects.select_for_update().get(pk=order.sub_user_id)
+
+    debited = BalanceTransaction.objects.filter(
+        order=order, type=BalanceTransaction.Type.DEBIT
+    ).aggregate(s=Sum('amount'))['s'] or Decimal('0')
+    refunded = BalanceTransaction.objects.filter(
+        order=order, type=BalanceTransaction.Type.REFUND
+    ).aggregate(s=Sum('amount'))['s'] or Decimal('0')
+    outstanding = debited - refunded
+    if outstanding <= 0:
+        return None
+
+    sub_user.balance += outstanding
+    sub_user.save(update_fields=['balance'])
+    return BalanceTransaction.objects.create(
+        sub_user=sub_user,
+        type=BalanceTransaction.Type.REFUND,
+        amount=outstanding,
+        order=order,
+        order_reference=order.shipstation_order_id,
+        description=description,
+        created_by=actor,
+    )
 
 
 def _variant_key(raw_options: dict) -> str:
@@ -7,7 +94,7 @@ def _variant_key(raw_options: dict) -> str:
     return "|".join(f"{k}:{v}" for k, v in sorted(raw_options.items()))
 
 
-def auto_match_item(order_item) -> bool:
+def auto_match_item(order_item, actor=None) -> bool:
     """
     Try to match an OrderItem to a PrintCenterVariant using saved ProductMappings.
     Returns True if matched.
@@ -48,17 +135,23 @@ def auto_match_item(order_item) -> bool:
         order_item.pc_variant = mapping.pc_variant
         order_item.matched_at = timezone.now()
         order_item.save(update_fields=['pc_variant', 'matched_at'])
+        log_event(
+            order_item.order, 'matched', actor=actor,
+            description=f'{order_item.raw_product_name} → {mapping.pc_variant}',
+        )
+        if sub_user.auto_design_matching:
+            auto_match_design(order_item, actor=actor)
         return True
     return False
 
 
-def auto_match_order(order) -> int:
+def auto_match_order(order, actor=None) -> int:
     """Run auto-match on all unmatched billable items. Returns count of newly matched items."""
     matched = 0
     for item in order.items.filter(pc_variant__isnull=True, unit_price__gte=0):
-        if auto_match_item(item):
+        if auto_match_item(item, actor=actor):
             matched += 1
-    refresh_order_status(order)
+    refresh_order_status(order, actor=actor)
     return matched
 
 
@@ -73,7 +166,7 @@ def order_has_design(order) -> bool:
     return OrderItemDesign.objects.filter(order_item__order=order).exists()
 
 
-def refresh_order_status(order) -> bool:
+def refresh_order_status(order, actor=None) -> bool:
     """Recompute order.status from match + design completeness.
 
     An order is 'ready' once all billable items are matched AND a design has
@@ -88,6 +181,8 @@ def refresh_order_status(order) -> bool:
     if order.status != new_status:
         order.status = new_status
         order.save(update_fields=['status'])
+        if new_status == Order.Status.READY:
+            log_event(order, 'ready', actor=actor, description='All items matched and designed')
     return ready
 
 
@@ -104,7 +199,7 @@ def _normalize_personalization(text):
     return text.lower()
 
 
-def auto_match_design(order_item) -> int:
+def auto_match_design(order_item, actor=None) -> int:
     """
     Try to auto-assign SkuDesigns to an order item's print areas.
     Returns count of areas matched.
@@ -148,6 +243,10 @@ def auto_match_design(order_item) -> int:
 
         design = _find_sku_design(sub_user, sku, area.name, color_name, is_dark, personalization)
         if design:
+            log_event(
+                order_item.order, 'design_uploaded', actor=actor,
+                description=f'{order_item.raw_product_name} — {area.name}: {design.file_name}',
+            )
             OrderItemDesign.objects.create(
                 order_item=order_item,
                 print_area_name=area.name,

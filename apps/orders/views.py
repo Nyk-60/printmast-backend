@@ -11,10 +11,11 @@ from apps.accounts.permissions import IsPrintCenter
 from apps.designs.models import OrderItemDesign, SkuDesign
 from apps.designs.serializers import OrderItemDesignSerializer
 
-from .models import Order, OrderItem, ProductMapping
+from .models import Order, OrderEvent, OrderItem, ProductMapping
 from .serializers import (
     AddressUpdateSerializer,
     MatchItemSerializer,
+    OrderActivityLogSerializer,
     OrderDetailSerializer,
     OrderListSerializer,
     ProductMappingSerializer,
@@ -23,6 +24,7 @@ from .serializers import (
 from .services import (
     auto_match_design,
     auto_match_order,
+    log_event,
     order_is_matched,
     parse_mapping_excel,
     refresh_order_status,
@@ -40,6 +42,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_fields = ('status', 'store', 'sub_user')
     search_fields = (
         'shipstation_order_number', 'customer_name', 'external_order_number', 'ship_to_name',
+        'tracking_number',
         'items__marketplace_sku', 'items__raw_product_name',
         'items__pc_variant__pc_product__name', 'items__pc_variant__pc_product__brand__name',
         'items__pc_variant__size', 'items__pc_variant__color',
@@ -120,6 +123,84 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     def get_serializer_class(self):
         return OrderListSerializer if self.action == 'list' else OrderDetailSerializer
 
+    # ── Tab counts ───────────────────────────────────────────────────────────
+
+    @action(detail=False, methods=['get'], url_path='tab-counts')
+    def tab_counts(self, request):
+        """Order count per status tab, honoring the same store/sub_user/search
+        filters as the list endpoint (but ignoring `tab` itself)."""
+        from django.db.models import Count
+
+        user = request.user
+        if user.is_sub_user:
+            base_qs = Order.objects.filter(sub_user=user.sub_user_profile, is_hidden=False)
+        elif user.is_print_center:
+            base_qs = Order.objects.filter(
+                store__shipstation_account__print_center=user.print_center_profile,
+                is_hidden=False,
+            )
+        else:
+            base_qs = Order.objects.none()
+
+        qs = self.filter_queryset(base_qs)
+        counts = {row['status']: row['c'] for row in qs.values('status').annotate(c=Count('id'))}
+
+        def total(statuses):
+            return sum(counts.get(s, 0) for s in statuses)
+
+        return Response({
+            'new_orders':      total(self.NEW_ORDER_STATUSES),
+            'ready_for_print': total(self.READY_FOR_PRINT_STATUSES),
+            'in_production':   total(self.IN_PRODUCTION_STATUSES),
+            'completed':       total(self.COMPLETED_STATUSES),
+        })
+
+    @action(detail=False, methods=['get'], url_path='ready-for-print-summary')
+    def ready_for_print_summary(self, request):
+        """Live running total for everything currently queued in Ready for Print,
+        honoring the same store/search filters as the list endpoint."""
+        from decimal import Decimal
+
+        from .services import calculate_order_cost
+
+        user = request.user
+        if user.is_sub_user:
+            base_qs = Order.objects.filter(sub_user=user.sub_user_profile, is_hidden=False)
+        elif user.is_print_center:
+            base_qs = Order.objects.filter(
+                store__shipstation_account__print_center=user.print_center_profile,
+                is_hidden=False,
+            )
+        else:
+            base_qs = Order.objects.none()
+
+        qs = self.filter_queryset(
+            base_qs.filter(status__in=self.READY_FOR_PRINT_STATUSES)
+        ).prefetch_related('items__pc_variant', 'items__designs')
+
+        count, total = 0, Decimal('0')
+        for order in qs:
+            count += 1
+            _, _, _, order_total = calculate_order_cost(order)
+            total += order_total
+
+        return Response({'count': count, 'total': total})
+
+    # ── Activity log (PC: search order history by order no / customer / tracking) ──
+
+    @action(detail=False, methods=['get'], url_path='activity-log', permission_classes=[IsPrintCenter])
+    def activity_log(self, request):
+        search = (request.query_params.get('search') or '').strip()
+        if not search:
+            return Response([])
+
+        base_qs = Order.objects.filter(
+            store__shipstation_account__print_center=request.user.print_center_profile,
+        ).select_related('store', 'sub_user__user').prefetch_related('events__actor')
+
+        qs = self.filter_queryset(base_qs).order_by('-created_at')[:25]
+        return Response(OrderActivityLogSerializer(qs, many=True).data)
+
     # ── Address ──────────────────────────────────────────────────────────────
 
     @action(detail=True, methods=['patch'], url_path='address')
@@ -163,6 +244,10 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             item.pc_variant_id = entry['pc_variant_id']
             item.matched_at = timezone.now()
             item.save(update_fields=['pc_variant', 'matched_at'])
+            log_event(
+                order, OrderEvent.EventType.MATCHED, actor=request.user,
+                description=f'{item.raw_product_name} → {item.pc_variant}',
+            )
 
             if entry.get('remember'):
                 from .services import _variant_key
@@ -176,9 +261,9 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
             # Try to auto-match designs after product is matched
             if request.user.sub_user_profile.auto_design_matching:
-                auto_match_design(item)
+                auto_match_design(item, actor=request.user)
 
-        self._refresh_order_status(order)
+        self._refresh_order_status(order, actor=request.user)
         return Response(OrderDetailSerializer(order).data)
 
     @action(detail=True, methods=['post'], url_path='auto-match')
@@ -186,8 +271,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         """Trigger auto product + design matching for all unmatched items."""
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
-        matched = auto_match_order(order)
-        self._refresh_order_status(order)
+        matched = auto_match_order(order, actor=request.user)
+        self._refresh_order_status(order, actor=request.user)
         return Response({'matched': matched})
 
     # ── Design upload ─────────────────────────────────────────────────────────
@@ -250,7 +335,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         )
         serializer.is_valid(raise_exception=True)
         design = serializer.save()
-        self._refresh_order_status(order)
+        log_event(
+            order, OrderEvent.EventType.DESIGN_UPLOADED, actor=request.user,
+            description=f'{item.raw_product_name} — {design.print_area_name}: {design.file_name}',
+        )
+        self._refresh_order_status(order, actor=request.user)
         resp = OrderItemDesignSerializer(design, context={'request': request}).data
         # When the upload scope doesn't match the item's color (e.g., dark on a white shirt),
         # the OID isn't updated so its sku_design still points to the previous matched design.
@@ -290,10 +379,14 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         except OrderItemDesign.DoesNotExist:
             raise NotFound()
 
+        log_event(
+            order, OrderEvent.EventType.DESIGN_REMOVED, actor=request.user,
+            description=f'{item.raw_product_name} — {design.print_area_name}',
+        )
         if design.file:
             design.file.delete(save=False)
         design.delete()
-        self._refresh_order_status(order)
+        self._refresh_order_status(order, actor=request.user)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['delete'], url_path='items/(?P<item_pk>[0-9]+)/library-design/(?P<sku_design_pk>[0-9]+)')
@@ -309,12 +402,16 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         # Remove any OrderItemDesign in this order that was linked to this SkuDesign
         OrderItemDesign.objects.filter(sku_design=sku_design, order_item__order=order).delete()
+        log_event(
+            order, OrderEvent.EventType.DESIGN_REMOVED, actor=request.user,
+            description=f'Library design removed: {sku_design.file_name}',
+        )
 
         if sku_design.file:
             sku_design.file.delete(save=False)
         sku_design.delete()
 
-        self._refresh_order_status(order)
+        self._refresh_order_status(order, actor=request.user)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     # ── Shipping ──────────────────────────────────────────────────────────────
@@ -334,7 +431,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         order.selected_carrier_code = carrier_code
         order.selected_service_code = service_code
         if displayed_rate is not None:
-            order.shipping_cost = displayed_rate
+            # Must be Decimal, not a raw JSON float — calculate_order_cost() adds
+            # this to other Decimal values in the very same request/response cycle
+            # (OrderDetailSerializer below), and Decimal + float raises TypeError.
+            from decimal import Decimal
+            order.shipping_cost = Decimal(str(displayed_rate))
         order.save(update_fields=['selected_carrier_code', 'selected_service_code', 'shipping_cost'])
         return Response(OrderDetailSerializer(order).data)
 
@@ -349,17 +450,23 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         if order.status != Order.Status.READY:
             return Response({'detail': 'Order must be matched and have a design before sending to print'}, status=400)
 
-        if not order.selected_carrier_code:
+        if not order.selected_carrier_code or not order.selected_service_code:
             return Response({'detail': 'Please select a shipping method first'}, status=400)
 
+        if order.shipping_cost is None:
+            return Response({'detail': 'Shipping rate not available yet — please retry rate selection'}, status=400)
+
         sub_user = request.user.sub_user_profile
-        total_cost = (order.shipping_cost or 0)
+
+        from .services import calculate_order_cost
+        item_cost, extra_print_area_fee, shipping_cost, total_cost = calculate_order_cost(order)
 
         # Check balance
         if not sub_user.can_afford(total_cost):
             return Response({'detail': 'Insufficient balance'}, status=402)
 
-        # Debit balance
+        # Debit balance — the full order cost (product + extra print areas + shipping),
+        # never just shipping alone, or production would be effectively free for the sub-user.
         from apps.accounts.models import BalanceTransaction
         sub_user_locked = type(sub_user).objects.select_for_update().get(pk=sub_user.pk)
         sub_user_locked.balance -= total_cost
@@ -369,7 +476,9 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             sub_user=sub_user_locked,
             type=BalanceTransaction.Type.DEBIT,
             amount=total_cost,
-            shipping_amount=order.shipping_cost or 0,
+            item_amount=item_cost + extra_print_area_fee,
+            shipping_amount=shipping_cost,
+            order=order,
             order_reference=order.shipstation_order_id,
             description=f'Order {order.shipstation_order_number} sent to print',
             created_by=request.user,
@@ -377,19 +486,56 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         order.status = Order.Status.SENT_TO_PRINT
         order.save(update_fields=['status'])
+        log_event(
+            order, OrderEvent.EventType.SENT_TO_PRINT, actor=request.user,
+            description=f'Charged ${total_cost}',
+        )
+
+        return Response(OrderDetailSerializer(order).data)
+
+    # ── Recall (pull back to New Orders before the PC has started production) ──
+
+    @action(detail=True, methods=['post'], url_path='recall')
+    @transaction.atomic
+    def recall_to_new_orders(self, request, pk=None):
+        order = self.get_object()
+        self._assert_sub_user_owns(request, order)
+
+        if order.status != Order.Status.SENT_TO_PRINT:
+            return Response(
+                {'detail': 'Only orders waiting to be picked up for production can be recalled.'},
+                status=400,
+            )
+
+        from .services import refund_order_debit
+        refund_order_debit(
+            order, request.user,
+            f'Order {order.shipstation_order_number} recalled from print queue',
+        )
+
+        order.status = Order.Status.READY
+        order.save(update_fields=['status'])
+        log_event(order, OrderEvent.EventType.RECALLED, actor=request.user)
 
         return Response(OrderDetailSerializer(order).data)
 
     # ── Cancel ────────────────────────────────────────────────────────────────
 
     @action(detail=True, methods=['post'], url_path='cancel')
+    @transaction.atomic
     def cancel(self, request, pk=None):
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
         if order.status in (Order.Status.IN_PRODUCTION, Order.Status.SHIPPED):
             return Response({'detail': 'Cannot cancel order in this status'}, status=400)
+
+        if order.status == Order.Status.SENT_TO_PRINT:
+            from .services import refund_order_debit
+            refund_order_debit(order, request.user, f'Order {order.shipstation_order_number} cancelled')
+
         order.status = Order.Status.CANCELLED
         order.save(update_fields=['status'])
+        log_event(order, OrderEvent.EventType.CANCELLED, actor=request.user)
         return Response(OrderDetailSerializer(order).data)
 
     # ── Hide (remove from platform) ───────────────────────────────────────────
@@ -400,6 +546,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         self._assert_sub_user_owns(request, order)
         order.is_hidden = True
         order.save(update_fields=['is_hidden'])
+        log_event(order, OrderEvent.EventType.HIDDEN, actor=request.user)
         return Response({'detail': 'Order removed from platform.'})
 
     # ── PC: shipping override ─────────────────────────────────────────────────
@@ -451,8 +598,8 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         if not sub:
             raise PermissionDenied('Sub-user access only.')
 
-    def _refresh_order_status(self, order):
-        refresh_order_status(order)
+    def _refresh_order_status(self, order, actor=None):
+        refresh_order_status(order, actor=actor)
         if order_is_matched(order):
             import logging
             import threading
@@ -494,7 +641,7 @@ class AutoMatchAllView(APIView):
         )
         total_matched = 0
         for order in unmatched_orders:
-            matched = auto_match_order(order)
+            matched = auto_match_order(order, actor=request.user)
             total_matched += matched
             if matched:
                 self._push_shipping(order)
@@ -686,7 +833,7 @@ class MappingUploadView(APIView):
                 .filter(items__pc_variant__isnull=True)
                 .distinct()
             )
-            auto_matched = sum(auto_match_order(o) for o in unmatched_orders)
+            auto_matched = sum(auto_match_order(o, actor=request.user) for o in unmatched_orders)
 
         return Response({
             'created': created,

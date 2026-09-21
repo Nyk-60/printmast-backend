@@ -258,7 +258,6 @@ class FinanceOverviewView(APIView):
                 'full_name': sub.user.full_name,
                 'balance': sub.balance,
                 'negative_balance_limit': sub.negative_balance_limit,
-                'credit_until': sub.credit_until,
                 'is_active': sub.is_active,
                 'total_credited': txs.filter(type=BalanceTransaction.Type.CREDIT).aggregate(
                     s=Sum('amount'))['s'] or Decimal('0'),

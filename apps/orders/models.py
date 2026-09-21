@@ -40,7 +40,20 @@ class Order(TimeStampedModel):
     ship_to_state = models.CharField(max_length=80, blank=True)
     ship_to_postal_code = models.CharField(max_length=20)
     ship_to_country = models.CharField(max_length=2, default='US')
-    address_verified = models.BooleanField(default=False)
+    address_verified = models.BooleanField(default=False)  # True only when address_status == validated
+
+    class AddressStatus(models.TextChoices):
+        UNKNOWN = 'unknown', 'Not validated'
+        VALIDATED = 'validated', 'Validated'
+        WARNING = 'warning', 'Warning'
+        FAILED = 'failed', 'Failed'
+
+    # Mirrors ShipStation's green/yellow/red address indicator (shipTo.addressVerified).
+    # Only the status is exposed by the API — not the reason (e.g. "Apt Number Not Found").
+    # A warning does not stop ShipStation from buying a label, so it must not block us either.
+    address_status = models.CharField(
+        max_length=10, choices=AddressStatus.choices, default=AddressStatus.UNKNOWN,
+    )
 
     # Dates
     ordered_at = models.DateTimeField(null=True, blank=True)
@@ -117,6 +130,51 @@ class OrderItem(TimeStampedModel):
 
     def __str__(self):
         return f'{self.order} / {self.raw_product_name[:50]}'
+
+
+class OrderEvent(TimeStampedModel):
+    """Immutable audit trail entry for one order's lifecycle.
+
+    Written explicitly at each meaningful transition (import, match, design
+    upload, send to print, recall, label purchase, ...) rather than derived
+    from field-change signals, so descriptions stay human-readable and the
+    set of logged events stays deliberate instead of noisy.
+    """
+
+    class EventType(models.TextChoices):
+        IMPORTED = 'imported', 'Imported'
+        MATCHED = 'matched', 'Product Matched'
+        DESIGN_UPLOADED = 'design_uploaded', 'Design Uploaded'
+        DESIGN_REMOVED = 'design_removed', 'Design Removed'
+        READY = 'ready', 'Ready for Print'
+        SENT_TO_PRINT = 'sent_to_print', 'Sent to Print'
+        RECALLED = 'recalled', 'Recalled to New Orders'
+        LABEL_ATTEMPT = 'label_attempt', 'Label Purchase Attempted'
+        LABEL_CONFIRMED = 'label_confirmed', 'Label Purchased'
+        LABEL_FAILED = 'label_failed', 'Label Purchase Failed'
+        IN_PRODUCTION = 'in_production', 'In Production'
+        SHIPPED = 'shipped', 'Shipped'
+        CANCELLED = 'cancelled', 'Cancelled'
+        STATUS_SYNCED = 'status_synced', 'Status Synced from ShipStation'
+        HIDDEN = 'hidden', 'Removed from Platform'
+        SHIPSTATION_NOTIFIED = 'shipstation_notified', 'ShipStation Notified (Marketplace)'
+        SHIPSTATION_NOTIFY_FAILED = 'shipstation_notify_failed', 'ShipStation Notify Failed'
+
+    order = models.ForeignKey(Order, related_name='events', on_delete=models.CASCADE)
+    event_type = models.CharField(max_length=30, choices=EventType.choices)
+    actor = models.ForeignKey(
+        'accounts.User', null=True, blank=True, on_delete=models.SET_NULL,
+        help_text='Who triggered this — null for system/sync-driven events.',
+    )
+    description = models.CharField(max_length=300, blank=True)
+    metadata = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        ordering = ('created_at',)
+        indexes = [models.Index(fields=['order', 'created_at'])]
+
+    def __str__(self):
+        return f'{self.order} — {self.get_event_type_display()}'
 
 
 class ProductMapping(TimeStampedModel):

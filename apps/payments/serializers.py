@@ -49,7 +49,6 @@ class SubUserBalanceSerializer(serializers.Serializer):
     full_name = serializers.CharField()
     balance = serializers.DecimalField(max_digits=12, decimal_places=2)
     negative_balance_limit = serializers.DecimalField(max_digits=12, decimal_places=2)
-    credit_until = serializers.DateField(allow_null=True)
     is_active = serializers.BooleanField()
     total_credited = serializers.DecimalField(max_digits=12, decimal_places=2)
     total_debited = serializers.DecimalField(max_digits=12, decimal_places=2)
