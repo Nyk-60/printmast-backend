@@ -35,6 +35,47 @@ def sync_stores_for_account(self, account_id):
     account.save(update_fields=['last_synced_at'])
 
 
+def sync_store_ship_from_address(store):
+    """Pull this store's ship-from address from its linked ShipStation warehouse.
+
+    Requires store.shipstation_warehouse_id to already be known (discovered
+    from an order's advancedOptions.warehouseId — see _upsert_orders). Returns
+    True on success, False if the warehouse isn't known yet or ShipStation
+    has no matching warehouse (e.g. it was deleted there).
+    """
+    from .client import ShipStationClient, ShipStationError
+
+    if not store.shipstation_warehouse_id:
+        return False
+
+    client = ShipStationClient(store.shipstation_account)
+    try:
+        warehouses = client.get_warehouses()
+    except ShipStationError:
+        return False
+
+    match = next(
+        (w for w in warehouses if str(w.get('warehouseId')) == store.shipstation_warehouse_id), None
+    )
+    if not match:
+        return False
+
+    addr = match.get('originAddress') or {}
+    store.ship_from_street1     = addr.get('street1') or ''
+    store.ship_from_street2     = addr.get('street2') or ''
+    store.ship_from_city        = addr.get('city') or ''
+    store.ship_from_state       = addr.get('state') or ''
+    store.ship_from_postal_code = addr.get('postalCode') or ''
+    store.ship_from_country     = addr.get('country') or ''
+    store.ship_from_phone       = addr.get('phone') or ''
+    store.ship_from_synced_at   = timezone.now()
+    store.save(update_fields=[
+        'ship_from_street1', 'ship_from_street2', 'ship_from_city', 'ship_from_state',
+        'ship_from_postal_code', 'ship_from_country', 'ship_from_phone', 'ship_from_synced_at',
+    ])
+    return True
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def sync_orders_for_store(self, store_id, modified_after_iso=None, update_only=False):
     """Pull new/updated orders from ShipStation for a store.
@@ -85,15 +126,17 @@ def sync_orders_for_store(self, store_id, modified_after_iso=None, update_only=F
             all_ss_ids.extend(str(o.get('orderId', '')) for o in orders)
             page += 1
 
-        # Hide DB orders with unprocessed statuses that are no longer open in ShipStation
-        if all_ss_ids:
-            from apps.orders.models import Order
-            (
-                Order.objects
-                .filter(store=store, is_hidden=False, status__in=('new', 'matching'))
-                .exclude(shipstation_order_id__in=all_ss_ids)
-                .update(is_hidden=True)
-            )
+        # Hide DB orders with unprocessed statuses that are no longer open in
+        # ShipStation — including when all_ss_ids is empty (no open orders at
+        # all means every unprocessed order in our DB is stale).
+        from apps.orders.models import Order
+
+        (
+            Order.objects
+            .filter(store=store, is_hidden=False, status__in=('new', 'matching'))
+            .exclude(shipstation_order_id__in=all_ss_ids)
+            .update(is_hidden=True)
+        )
 
 
 # ShipStation terminal statuses → our status (only override to these, never downgrade)
@@ -113,9 +156,24 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
 
     from apps.orders.models import Order, OrderItem
 
+    from .utils import map_address_status
+
     sub_user = store.assigned_sub_users.filter(is_active=True).first()
     if not sub_user:
         return  # store not assigned — skip
+
+    # Discover which ShipStation warehouse (→ ship-from address) this store
+    # uses, the first time we see it referenced on one of its orders.
+    if not store.shipstation_warehouse_id:
+        warehouse_id = next((
+            str(raw['advancedOptions']['warehouseId'])
+            for raw in raw_orders
+            if (raw.get('advancedOptions') or {}).get('warehouseId')
+        ), None)
+        if warehouse_id:
+            store.shipstation_warehouse_id = warehouse_id
+            store.save(update_fields=['shipstation_warehouse_id'])
+            sync_store_ship_from_address(store)
 
     for raw in raw_orders:
         ss_order_id = str(raw.get('orderId', ''))
@@ -129,6 +187,13 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
             except Order.DoesNotExist:
                 continue
             created = False
+            # Keep the address indicator fresh (e.g. after an address fix) without
+            # rewriting the rest of the address.
+            new_addr_status = map_address_status((raw.get('shipTo') or {}).get('addressVerified'))
+            if order.address_status != new_addr_status:
+                order.address_status = new_addr_status
+                order.address_verified = new_addr_status == 'validated'
+                order.save(update_fields=['address_status', 'address_verified'])
         else:
             ship_to = raw.get('shipTo') or {}
             defaults = {
@@ -145,6 +210,8 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
                 'ship_to_state': ship_to.get('state') or '',
                 'ship_to_postal_code': ship_to.get('postalCode') or '',
                 'ship_to_country': ship_to.get('country') or 'US',
+                'address_status': map_address_status(ship_to.get('addressVerified')),
+                'address_verified': map_address_status(ship_to.get('addressVerified')) == 'validated',
                 'requested_service': raw.get('requestedShippingService') or '',
                 'buyer_note':    raw.get('customerNotes') or '',
                 'gift_message':  raw.get('giftMessage') or '',
@@ -162,11 +229,36 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
         ss_status = (raw.get('orderStatus') or '').lower()
         new_status = _SS_TO_STATUS.get(ss_status)
 
-        # Don't import orders that arrived already completed — they were
-        # fulfilled outside this platform. Only update existing ones.
-        if created and new_status:
-            order.delete()
-            continue
+        if new_status:
+            # An order reaching a terminal ShipStation status without ever being
+            # sent to print through this platform (regardless of whether a design
+            # was uploaded to it) was fulfilled — or already closed — outside this
+            # platform. It must never surface here as "ours", let alone "completed":
+            # only a label actually purchased through our own production flow counts.
+            engaged = order.labeled_at is not None or order.status not in (
+                Order.Status.NEW, Order.Status.MATCHING, Order.Status.READY,
+            )
+            if not engaged:
+                if created:
+                    order.delete()
+                else:
+                    from apps.orders.services import log_event
+                    log_event(
+                        order, 'status_synced', actor=None,
+                        description=f'Hidden — reached "{ss_status}" on ShipStation without ever being processed here',
+                    )
+                    order.status = new_status
+                    order.is_hidden = True
+                    order.save(update_fields=['status', 'is_hidden'])
+                continue
+
+            # Once sent to print, the sub-user has committed this order to the
+            # print center — only this platform's own actions (production
+            # marking it shipped, or the sub-user explicitly recalling/removing
+            # it) may change that. An external ShipStation status must never
+            # silently override it, even if it looks fulfilled elsewhere.
+            if order.status in (Order.Status.SENT_TO_PRINT, Order.Status.IN_PRODUCTION):
+                continue
 
         if new_status and order.status != new_status:
             update_fields = ['status']
@@ -188,8 +280,16 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
                 order.tracking_number = tracking
                 update_fields.append('tracking_number')
             order.save(update_fields=update_fields)
+            from apps.orders.services import log_event
+            log_event(
+                order, new_status, actor=None,
+                description=f'Status synced from ShipStation ({ss_status})',
+            )
 
         if created:
+            from apps.orders.services import log_event
+            log_event(order, 'imported', actor=None, description=f'Imported from {store.name}')
+
             for item in raw.get('items') or []:
                 options = {o['name']: o['value'] for o in item.get('options') or []}
                 OrderItem.objects.create(
@@ -250,9 +350,18 @@ def push_address_to_shipstation(self, order_id):
 
     client = ShipStationClient(order.store.shipstation_account)
     try:
-        client.update_order_address(order)
+        result = client.update_order_address(order)
     except ShipStationError as exc:
         raise self.retry(exc=exc)
+
+    # ShipStation re-validates the edited address; reflect the new indicator now
+    # (it may still read "not yet validated" — the next sync refreshes it).
+    if isinstance(result, dict) and result.get('shipTo'):
+        from .utils import map_address_status
+        status = map_address_status(result['shipTo'].get('addressVerified'))
+        Order.objects.filter(pk=order.pk).update(
+            address_status=status, address_verified=(status == 'validated'),
+        )
 
 
 @shared_task
@@ -350,9 +459,12 @@ def auto_select_shipping_for_order(self, order_id):
     Does nothing if the order already has a carrier/service selected, or if
     the print center hasn't configured any options for the category.
     """
+    from apps.accounts.models import PrintCenterProfile
     from apps.orders.models import Order
     from apps.shipping.models import ShippingServiceDefault, ShippingServiceOption
-    from apps.shipping.utils import categorize_requested_service, get_order_shipping_config
+    from apps.shipping.utils import (
+        categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config,
+    )
     from .client import ShipStationClient, ShipStationError
 
     try:
@@ -371,18 +483,34 @@ def auto_select_shipping_for_order(self, order_id):
     pc = order.store.shipstation_account.print_center
     category = categorize_requested_service(order.requested_service)
 
+    if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
+        weight_oz, _ = get_order_shipping_config(order)
+        if not weight_oz:
+            return
+        price = get_fixed_shipping_price(pc, category, weight_oz)
+        if price is None:
+            return  # no bracket configured for this weight — leave for manual selection
+        _apply_shipping_selection(order, 'fixed', category, float(price))
+        return
+
+    # This picks a displayed ShipStation rate ahead of send-to-print — the
+    # cross-provider comparison at actual label-purchase time (see
+    # apps/shipping/services.py) is a separate, later step.
     options = list(ShippingServiceOption.objects.filter(
-        print_center=pc, category=category, is_active=True
+        print_center=pc, category=category, is_active=True, provider='shipstation',
     ))
     if not options:
         return  # PC hasn't configured this category — leave for manual selection
+
+    if not order.store.ship_from_configured:
+        return  # store has no synced ship-from address yet — leave for manual selection
 
     weight_oz, dimensions = get_order_shipping_config(order)
     if not weight_oz:
         return
 
     client = ShipStationClient(order.store.shipstation_account)
-    from_postal = pc.ship_from_postal_code or '00000'
+    from_postal = order.store.ship_from_postal_code
     try:
         rates = client.get_rates(
             from_postal=from_postal,
@@ -421,7 +549,15 @@ def auto_select_shipping_for_order(self, order_id):
         chosen_key = min(best, key=best.get)
 
     base_cost = best[chosen_key]
+    _apply_shipping_selection(order, chosen_key[0], chosen_key[1], base_cost)
 
+
+def _apply_shipping_selection(order, carrier_code, service_code, base_cost):
+    """Apply markup to a base shipping cost and save it as the order's selection.
+
+    Shared by the ShipStation-rate-shopping path and the fixed-price-table
+    path — the markup step is identical either way.
+    """
     sub_profile = order.sub_user
     markup_type = sub_profile.shipping_markup_type
     markup_value = float(sub_profile.shipping_markup_value)
@@ -430,8 +566,8 @@ def auto_select_shipping_for_order(self, order_id):
     else:
         displayed = base_cost + markup_value
 
-    order.selected_carrier_code = chosen_key[0]
-    order.selected_service_code = chosen_key[1]
+    order.selected_carrier_code = carrier_code
+    order.selected_service_code = service_code
     order.shipping_cost_raw = round(base_cost, 2)
     order.shipping_cost = round(displayed, 2)
     order.save(update_fields=[
@@ -448,8 +584,9 @@ def refresh_shipping_rate_for_order(self, order_id):
     If no carrier/service is selected yet, falls back to auto-selecting one.
     No-op if the print center hasn't configured this category, or weight is unknown.
     """
+    from apps.accounts.models import PrintCenterProfile
     from apps.orders.models import Order
-    from apps.shipping.utils import get_order_shipping_config
+    from apps.shipping.utils import categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config
     from .client import ShipStationClient, ShipStationError
 
     try:
@@ -471,8 +608,20 @@ def refresh_shipping_rate_for_order(self, order_id):
         return
 
     pc = order.store.shipstation_account.print_center
+
+    if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
+        category = categorize_requested_service(order.requested_service)
+        price = get_fixed_shipping_price(pc, category, weight_oz)
+        if price is None:
+            return
+        _apply_shipping_selection(order, 'fixed', category, float(price))
+        return
+
+    if not order.store.ship_from_configured:
+        return  # store has no synced ship-from address yet — nothing to refresh against
+
     client = ShipStationClient(order.store.shipstation_account)
-    from_postal = pc.ship_from_postal_code or '00000'
+    from_postal = order.store.ship_from_postal_code
     try:
         rates = client.get_rates(
             from_postal=from_postal,

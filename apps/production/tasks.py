@@ -46,6 +46,7 @@ def generate_batch(self, batch_id: int):
 def _run_batch(batch):
     from apps.designs.models import OrderItemDesign
     from apps.orders.models import Order
+    from apps.orders.services import log_event
 
     from .gang_sheet import render_gang_sheet
     from .models import BatchOrder, GangSheet, OrderSlipPDF
@@ -109,53 +110,26 @@ def _run_batch(batch):
         for p in sheet_placements:
             order_sheet_map[p.order_id] = sheet_idx
 
-    # ── Purchase ShipStation labels ──────────────────────────────────────────
+    # ── Purchase labels (rate-shopped across every active provider) ──────────
+    #
+    # purchase_label_for_order() is idempotent: if this task is retried
+    # (Celery retries the whole batch on any exception in _run_batch — e.g. a
+    # later order's gang-sheet rendering failing), an order whose label was
+    # already bought on a prior attempt is never charged/purchased again.
+    # See apps/shipping/services.py for the locking + audit-trail details.
+    from apps.shipping.services import purchase_label_for_order
+
     label_images = {}
     for bo in batch_orders:
         order = bo.order
         if not order.selected_carrier_code:
             continue
         try:
-            from django.utils import timezone as tz
-            from apps.shipping.client import ShipStationClient, ShipStationError
-            from apps.shipping.utils import get_order_shipping_config
-            client = ShipStationClient(order.store.shipstation_account)
-
-            # Refresh shipFrom/weight/dims right before label purchase so the
-            # label uses the print center's current sender address and the
-            # matched product's weight/dimensions.
-            try:
-                weight_oz, dimensions = get_order_shipping_config(order)
-                client.update_order_shipping_config(order, weight_oz=weight_oz, dimensions=dimensions)
-            except ShipStationError as exc:
-                logger.warning('Pre-label shipping config push failed for order %s: %s', order.id, exc)
-
-            result = client.create_label(
-                shipstation_order_id=order.shipstation_order_id,
-                carrier_code=order.selected_carrier_code,
-                service_code=order.selected_service_code,
-            )
-            # Store tracking info
-            order.tracking_number = result.get('trackingNumber', '')
-            order.shipstation_shipment_id = str(result.get('shipmentId', ''))
-            order.label_cost = result.get('shipmentCost')
-            order.label_url = result.get('labelDownload', {}).get('href', '')
-            order.labeled_at = tz.now()
-            order.save(update_fields=[
-                'tracking_number', 'shipstation_shipment_id', 'label_cost', 'label_url', 'labeled_at'
-            ])
-
-            bo.label_purchased = True
-            bo.label_cost = order.label_cost
-            bo.save(update_fields=['label_purchased', 'label_cost'])
-
-            # Try to get label image (PNG) for embedding in PDF
-            label_data = result.get('labelData')
-            if label_data:
-                import base64
-                label_images[order.id] = base64.b64decode(label_data)
+            image_bytes = purchase_label_for_order(order, batch_order=bo)
+            if image_bytes:
+                label_images[order.id] = image_bytes
         except Exception as exc:
-            logger.warning('Label purchase failed for order %s: %s', order.id, exc)
+            logger.exception('Unexpected error purchasing label for order %s: %s', order.id, exc)
 
     # ── Render gang sheets ───────────────────────────────────────────────────
     gang_sheet_objs = []
@@ -213,5 +187,6 @@ def _run_batch(batch):
 
     # Update orders to IN_PRODUCTION
     order_ids = [bo.order_id for bo in batch_orders]
-    from apps.orders.models import Order
     Order.objects.filter(pk__in=order_ids).update(status=Order.Status.IN_PRODUCTION)
+    for bo in batch_orders:
+        log_event(bo.order, 'in_production', description=f'Batch #{batch.id}')

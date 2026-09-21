@@ -4,13 +4,23 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import SubUserProfile
+from apps.accounts.models import PrintCenterProfile, SubUserProfile
 from apps.accounts.permissions import IsPrintCenter
 
+from .byelabel_client import ByeLabelClient
 from .client import ShipStationClient, ShipStationError
-from .models import ShipStationAccount, ShippingServiceDefault, ShippingServiceOption, Store
+from .models import (
+    FixedShippingRate,
+    LabelProviderAccount,
+    ShipStationAccount,
+    ShippingServiceDefault,
+    ShippingServiceOption,
+    Store,
+)
 from .serializers import (
     AssignStoreSerializer,
+    FixedShippingRateSerializer,
+    LabelProviderAccountSerializer,
     RateRequestSerializer,
     ShippingServiceDefaultSerializer,
     ShippingServiceOptionSerializer,
@@ -184,6 +194,41 @@ class StoreSyncView(APIView):
         return Response({'detail': 'Order sync started'})
 
 
+class StoreSyncShipFromView(APIView):
+    """Manually re-pull this store's ship-from address from its ShipStation warehouse."""
+    permission_classes = (IsPrintCenter,)
+
+    def post(self, request, pk):
+        try:
+            store = Store.objects.get(
+                pk=pk,
+                shipstation_account__print_center=request.user.print_center_profile,
+            )
+        except Store.DoesNotExist:
+            raise NotFound()
+
+        from .tasks import sync_store_ship_from_address
+
+        if not store.shipstation_warehouse_id:
+            # Not discovered from an order yet — try once now via ShipStation's
+            # warehouse list, matching by name as a best-effort first link.
+            warehouses = ShipStationClient(store.shipstation_account).get_warehouses()
+            match = next((w for w in warehouses if w.get('warehouseName') == store.name), None)
+            if match:
+                store.shipstation_warehouse_id = str(match.get('warehouseId'))
+                store.save(update_fields=['shipstation_warehouse_id'])
+
+        ok = sync_store_ship_from_address(store)
+        if not ok:
+            return Response(
+                {'detail': 'No matching ShipStation warehouse found for this store yet. '
+                           'Configure a Ship From location for it in ShipStation, or sync orders first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        store.refresh_from_db()
+        return Response(StoreSerializer(store).data)
+
+
 class MyStoresSyncView(APIView):
     """Sub-user triggers a sync for all their assigned stores."""
     permission_classes = (IsAuthenticated,)
@@ -287,6 +332,72 @@ class StoreUpdateView(APIView):
         return Response(StoreSerializer(store).data)
 
 
+# ── Label provider accounts (print center enables/disables label-purchase sources) ──
+
+class LabelProviderAccountListCreateView(APIView):
+    permission_classes = (IsPrintCenter,)
+
+    def get(self, request):
+        qs = LabelProviderAccount.objects.filter(
+            print_center=request.user.print_center_profile
+        ).select_related('shipstation_account')
+        return Response(LabelProviderAccountSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = LabelProviderAccountSerializer(
+            data=request.data, context={'print_center': request.user.print_center_profile},
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if data['provider'] == LabelProviderAccount.Provider.BYELABEL:
+            account = LabelProviderAccount(print_center=request.user.print_center_profile, **data)
+            ok, err = ByeLabelClient(account).verify()
+            if not ok:
+                return Response({'detail': f'Could not connect to ByeLabel: {err}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        saved = serializer.save()
+        return Response(LabelProviderAccountSerializer(saved).data, status=status.HTTP_201_CREATED)
+
+
+class LabelProviderAccountDetailView(APIView):
+    permission_classes = (IsPrintCenter,)
+
+    def _get(self, request, pk):
+        try:
+            return LabelProviderAccount.objects.get(pk=pk, print_center=request.user.print_center_profile)
+        except LabelProviderAccount.DoesNotExist:
+            raise NotFound()
+
+    def patch(self, request, pk):
+        account = self._get(request, pk)
+        serializer = LabelProviderAccountSerializer(
+            account, data=request.data, partial=True,
+            context={'print_center': request.user.print_center_profile},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        if (account.provider == LabelProviderAccount.Provider.BYELABEL
+                and any(f in serializer.validated_data for f in
+                        ('byelabel_client_id', 'byelabel_client_secret', 'byelabel_workspace_id'))):
+            test = LabelProviderAccount(
+                print_center=account.print_center,
+                byelabel_client_id=serializer.validated_data.get('byelabel_client_id', account.byelabel_client_id),
+                byelabel_client_secret=serializer.validated_data.get('byelabel_client_secret') or account.byelabel_client_secret,
+                byelabel_workspace_id=serializer.validated_data.get('byelabel_workspace_id', account.byelabel_workspace_id),
+            )
+            ok, err = ByeLabelClient(test).verify()
+            if not ok:
+                return Response({'detail': f'Could not connect to ByeLabel: {err}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer.save()
+        return Response(LabelProviderAccountSerializer(account).data)
+
+    def delete(self, request, pk):
+        self._get(request, pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 # ── Shipping service options (print center configures per category) ──────────
 
 class ServiceOptionListCreateView(APIView):
@@ -332,10 +443,56 @@ class ServiceOptionDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+# ── Fixed shipping rates (flat price table, used when pricing_mode == 'fixed') ─
+
+class FixedShippingRateListCreateView(APIView):
+    permission_classes = (IsPrintCenter,)
+
+    def get(self, request):
+        qs = FixedShippingRate.objects.filter(print_center=request.user.print_center_profile)
+        return Response(FixedShippingRateSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = FixedShippingRateSerializer(
+            data=request.data, context={'print_center': request.user.print_center_profile},
+        )
+        serializer.is_valid(raise_exception=True)
+        obj = serializer.save()
+        return Response(FixedShippingRateSerializer(obj).data, status=status.HTTP_201_CREATED)
+
+
+class FixedShippingRateDetailView(APIView):
+    permission_classes = (IsPrintCenter,)
+
+    def _get(self, request, pk):
+        try:
+            return FixedShippingRate.objects.get(pk=pk, print_center=request.user.print_center_profile)
+        except FixedShippingRate.DoesNotExist:
+            raise NotFound()
+
+    def patch(self, request, pk):
+        obj = self._get(request, pk)
+        serializer = FixedShippingRateSerializer(
+            obj, data=request.data, partial=True,
+            context={'print_center': request.user.print_center_profile},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(FixedShippingRateSerializer(obj).data)
+
+    def delete(self, request, pk):
+        self._get(request, pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 # ── Shipping service defaults (sub-user picks default per category) ──────────
 
 class MyServiceOptionsView(APIView):
-    """Sub-user: list their print center's active service options, for picking defaults."""
+    """Sub-user: list their print center's active service options, for picking defaults.
+
+    ShipStation-only: this picks the displayed rate shown ahead of send-to-print.
+    Which provider actually buys the label is a separate, later comparison.
+    """
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
@@ -343,7 +500,7 @@ class MyServiceOptionsView(APIView):
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
         qs = ShippingServiceOption.objects.filter(
-            print_center=sub_profile.print_center, is_active=True
+            print_center=sub_profile.print_center, is_active=True, provider='shipstation',
         )
         return Response(ShippingServiceOptionSerializer(qs, many=True).data)
 
@@ -399,19 +556,13 @@ class RatesView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        # Determine which ShipStation account to use (via sub-user's assigned stores)
+        # Determine which store/ShipStation account to use — prefer the order's
+        # actual store (each store has its own ship-from address), falling back
+        # to the sub-user's first assigned store only when no order is given.
         sub_profile = getattr(request.user, 'sub_user_profile', None)
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
 
-        store = sub_profile.assigned_stores.filter(is_active=True).first()
-        if not store:
-            return Response({'detail': 'No active store assigned'}, status=400)
-
-        account = store.shipstation_account
-        client = ShipStationClient(account)
-
-        # Determine package dimensions — use order-specific dims if order_id provided
         dimensions = {'length': 12, 'width': 10, 'height': 2, 'units': 'inches'}
         order = None
         order_id = data.get('order_id')
@@ -419,15 +570,52 @@ class RatesView(APIView):
             from apps.orders.models import Order
             from .utils import calculate_order_dimensions
             try:
-                order = Order.objects.prefetch_related(
+                order = Order.objects.select_related('store__shipstation_account').prefetch_related(
                     'items__pc_variant__dimension_rules'
                 ).get(id=order_id, sub_user=sub_profile)
                 dimensions = calculate_order_dimensions(order)
             except Order.DoesNotExist:
                 pass
 
+        store = order.store if order else sub_profile.assigned_stores.filter(is_active=True).first()
+        if not store:
+            return Response({'detail': 'No active store assigned'}, status=400)
+
+        account = store.shipstation_account
+        client = ShipStationClient(account)
+
+        if not store.ship_from_configured:
+            return Response(
+                {'detail': f'"{store.name}" has no ship-from address yet. Sync it from '
+                           'ShipStation in the ShipStation Integration page before quoting rates.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         pc = account.print_center
-        from_postal = pc.ship_from_postal_code or '00000'
+        from_postal = store.ship_from_postal_code
+
+        from .utils import categorize_requested_service
+        category = categorize_requested_service(order.requested_service if order else '')
+
+        if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
+            from .utils import get_fixed_shipping_price
+            price = get_fixed_shipping_price(pc, category, data['weight_oz'])
+            if price is None:
+                return Response(
+                    {'detail': f'No fixed shipping price configured for "{category}" at this weight.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            markup_type = sub_profile.shipping_markup_type
+            markup_value = float(sub_profile.shipping_markup_value)
+            base = float(price)
+            displayed = base * (1 + markup_value / 100) if markup_type == 'percent' else base + markup_value
+            return Response({'rates': [{
+                'carrier_code': 'fixed',
+                'service_code': category,
+                'service_name': f'{category.title()} Shipping',
+                'base_rate': round(base, 2),
+                'displayed_rate': round(displayed, 2),
+                'is_default': True,
+            }]})
 
         try:
             rates = client.get_rates(
@@ -441,10 +629,12 @@ class RatesView(APIView):
         except ShipStationError as e:
             return Response({'detail': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
 
-        # Keep only the services the print center has configured, deduplicate by serviceCode (cheapest wins)
+        # Keep only the ShipStation services the print center has configured, deduplicate
+        # by serviceCode (cheapest wins). This is the displayed pre-send-to-print rate —
+        # which provider actually buys the label is a separate, later comparison.
         allowed_services = set(
             ShippingServiceOption.objects.filter(
-                print_center=pc, is_active=True,
+                print_center=pc, is_active=True, provider='shipstation',
             ).values_list('service_code', flat=True)
         )
         seen, deduped = {}, []
@@ -462,10 +652,6 @@ class RatesView(APIView):
         # Apply sub-user shipping markup
         markup_type = sub_profile.shipping_markup_type
         markup_value = float(sub_profile.shipping_markup_value)
-
-        # Determine which category's default applies, based on the marketplace's requested service
-        from .utils import categorize_requested_service
-        category = categorize_requested_service(order.requested_service if order else '')
 
         default = ShippingServiceDefault.objects.filter(
             sub_user=sub_profile, category=category, service_option__isnull=False,

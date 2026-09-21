@@ -94,6 +94,34 @@ def calculate_order_dimensions(order):
     }
 
 
+def map_address_status(shipstation_value):
+    """ShipStation shipTo.addressVerified text -> Order.AddressStatus value."""
+    text = (shipstation_value or '').lower()
+    if 'validated successfully' in text:
+        return 'validated'
+    if 'warning' in text:
+        return 'warning'
+    if 'failed' in text:
+        return 'failed'
+    return 'unknown'  # "not yet validated", "not supported", missing
+
+
+def sanitize_label_text(value):
+    """Make free text safe for carrier/label APIs: strip emoji, symbols and control
+    characters, fold accents to ASCII, collapse whitespace. Marketplace names and
+    addresses routinely contain emoji that ShipStation tolerates but stricter label
+    APIs reject. Returns '' if nothing printable survives (caller must treat that
+    as a missing field rather than send garbage)."""
+    import re
+    import unicodedata
+
+    text = unicodedata.normalize('NFKD', value or '')
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r'[^\x20-\x7E]', '', text)          # printable ASCII only
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def categorize_requested_service(requested_service):
     """Map a marketplace requested_service string to a ShippingServiceOption category.
 
@@ -105,6 +133,27 @@ def categorize_requested_service(requested_service):
     if 'priority' in s or 'expedited' in s or '2nd day' in s or '2-day' in s or 'second day' in s:
         return 'priority'
     return 'standard'
+
+
+def get_fixed_shipping_price(print_center, category, weight_oz):
+    """Look up the print center's flat shipping price for this category/weight.
+
+    Returns a Decimal, or None if no bracket covers this weight (caller must
+    treat this the same as "no rate available" — never silently fall back to
+    a wrong bracket).
+    """
+    from decimal import Decimal
+
+    from django.db.models import Q
+
+    from .models import FixedShippingRate
+
+    weight = Decimal(str(weight_oz))
+    qs = FixedShippingRate.objects.filter(
+        print_center=print_center, category=category, min_weight_oz__lte=weight,
+    ).filter(Q(max_weight_oz__isnull=True) | Q(max_weight_oz__gte=weight))
+    bracket = qs.order_by('min_weight_oz').first()
+    return bracket.price if bracket else None
 
 
 def get_order_shipping_config(order):

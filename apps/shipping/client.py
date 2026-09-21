@@ -75,6 +75,15 @@ class ShipStationClient:
             data = self._get('/accounts/stores')
             return data.get('stores', [])
 
+    def get_warehouses(self):
+        """Returns list of warehouse dicts — each carries originAddress (ship-from)
+        and returnAddress. V1 only; ShipStation V2 does not expose this resource
+        the same way, callers should treat an empty list as "unavailable"."""
+        if self._account.api_version == 'V1':
+            data = self._get('/warehouses')
+            return data if isinstance(data, list) else []
+        return []
+
     # ── Orders ───────────────────────────────────────────────────────────────
 
     def get_orders(self, store_id, page=1, page_size=500, modified_after=None,
@@ -137,26 +146,29 @@ class ShipStationClient:
 
     @staticmethod
     def build_ship_from(order):
-        """Build shipFrom dict from PC address + Store sender name.
+        """Build shipFrom dict from the store's synced ShipStation warehouse address.
 
-        Physical address  → PrintCenterProfile.ship_from_*
+        Physical address  → Store.ship_from_* (synced from this store's ShipStation
+                             warehouse — see sync_store_ship_from_address)
         Sender name       → Store.ship_from_name (falls back to PC company name)
-        Returns None if PC has no address configured yet.
+        Returns None if this store has no synced address yet — callers must
+        then omit shipFrom entirely rather than guess, letting ShipStation fall
+        back to its own warehouse default for the order.
         """
         pc    = order.store.shipstation_account.print_center
         store = order.store
-        if not pc.ship_from_postal_code:
+        if not store.ship_from_configured:
             return None
         return {
             'name':       store.ship_from_name or pc.ship_from_name or pc.company_name,
             'company':    store.ship_from_company or '',
-            'street1':    pc.ship_from_street1,
-            'street2':    pc.ship_from_street2 or '',
-            'city':       pc.ship_from_city,
-            'state':      pc.ship_from_state,
-            'postalCode': pc.ship_from_postal_code,
-            'country':    pc.ship_from_country or 'US',
-            'phone':      pc.ship_from_phone or '',
+            'street1':    store.ship_from_street1,
+            'street2':    store.ship_from_street2 or '',
+            'city':       store.ship_from_city,
+            'state':      store.ship_from_state,
+            'postalCode': store.ship_from_postal_code,
+            'country':    store.ship_from_country or 'US',
+            'phone':      store.ship_from_phone or '',
         }
 
     def update_order_address(self, order):
@@ -394,6 +406,24 @@ class ShipStationClient:
                 'confirmation': confirmation,
                 'testLabel': test_label,
             })
+
+    def mark_as_shipped(self, *, shipstation_order_id, carrier_code, tracking_number,
+                        ship_date=None, notify_customer=False, notify_sales_channel=True):
+        """Mark an order shipped in ShipStation with tracking from a label bought
+        elsewhere. With notify_sales_channel, ShipStation pushes the tracking to
+        the marketplace (Etsy etc.) exactly as for its own labels. V1 only."""
+        if self._account.api_version != 'V1':
+            raise ShipStationError('markasshipped is only supported for V1 accounts')
+        payload = {
+            'orderId': int(shipstation_order_id),
+            'carrierCode': carrier_code,
+            'trackingNumber': tracking_number,
+            'notifyCustomer': notify_customer,
+            'notifySalesChannel': notify_sales_channel,
+        }
+        if ship_date:
+            payload['shipDate'] = ship_date
+        return self._post('/orders/markasshipped', json=payload)
 
     # ── Webhooks ─────────────────────────────────────────────────────────────
 
