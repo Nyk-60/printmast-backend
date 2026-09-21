@@ -1,10 +1,42 @@
 """ShipStation API client supporting V1 (Basic Auth) and V2 (API-Key header)."""
+import contextvars
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from django.conf import settings
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+
+# ShipStation allows 40 requests/minute per API key. Interactive requests stay
+# unthrottled (a person is waiting); bulk jobs such as a batch's label pass switch
+# this on so a thousand orders queue politely instead of hitting 429s.
+_THROTTLE = contextvars.ContextVar('shipstation_throttle', default=False)
+_MIN_INTERVAL = 60.0 / 38          # a little under the 40/min limit
+_throttle_lock = threading.Lock()
+_last_call: dict = {}
+
+
+def set_throttle(enabled):
+    """Turn request pacing on/off for the current thread/context. Returns a token
+    for reset_throttle()."""
+    return _THROTTLE.set(bool(enabled))
+
+
+def reset_throttle(token):
+    _THROTTLE.reset(token)
+
+
+def _pace(key):
+    if not _THROTTLE.get():
+        return
+    with _throttle_lock:
+        wait = _last_call.get(key, 0) + _MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[key] = time.monotonic()
 
 
 class ShipStationError(Exception):
@@ -39,14 +71,33 @@ class ShipStationClient:
     def _url(self, path):
         return f'{self._base}/{path.lstrip("/")}'
 
+    def _wait_if_rate_limited(self, r):
+        """On a 429 wait out the window ShipStation reports, then let the caller retry."""
+        if r.status_code == 429 and _THROTTLE.get():
+            time.sleep(min(float(r.headers.get('X-Rate-Limit-Reset', 30) or 30) + 1, 65))
+            return True
+        return False
+
     def _get(self, path, params=None):
-        r = self._session.get(self._url(path), params=params, timeout=30)
+        for attempt in (1, 2):
+            _pace(self._account.pk)
+            r = self._session.get(self._url(path), params=params, timeout=30)
+            if attempt == 1 and self._wait_if_rate_limited(r):
+                continue
+            break
         if not r.ok:
             raise ShipStationError(r.text, r.status_code)
         return r.json()
 
     def _post(self, path, json=None):
-        r = self._session.post(self._url(path), json=json, timeout=30)
+        # A 429 means the request was rejected before processing, so re-sending it
+        # cannot create a duplicate; anything else is returned as-is (never re-sent).
+        for attempt in (1, 2):
+            _pace(self._account.pk)
+            r = self._session.post(self._url(path), json=json, timeout=30)
+            if attempt == 1 and self._wait_if_rate_limited(r):
+                continue
+            break
         if not r.ok:
             raise ShipStationError(r.text, r.status_code)
         return r.json()

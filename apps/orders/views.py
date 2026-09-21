@@ -225,6 +225,39 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         return Response(OrderDetailSerializer(order).data)
 
+    @action(detail=True, methods=['patch'], url_path='pc-address', permission_classes=[IsPrintCenter])
+    def pc_update_address(self, request, pk=None):
+        """Print center fixes a delivery address (e.g. one a label purchase rejected).
+        Only before the label exists — once bought, the label carries the old address."""
+        order = self.get_object()
+        if order.labeled_at or order.status != Order.Status.SENT_TO_PRINT:
+            return Response(
+                {'detail': 'The address can only be changed while the order is waiting to be labeled.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = AddressUpdateSerializer(order, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        order.address_status = Order.AddressStatus.UNKNOWN
+        order.address_verified = False
+        order.save(update_fields=['address_status', 'address_verified'])
+        log_event(order, OrderEvent.EventType.ADDRESS_EDITED, actor=request.user,
+                  description='Delivery address edited by the print center')
+
+        import threading
+
+        def _push():
+            try:
+                from django.db import close_old_connections
+                close_old_connections()
+                from apps.shipping.tasks import push_address_to_shipstation
+                push_address_to_shipstation(order.pk)
+            except Exception:
+                pass
+        threading.Thread(target=_push, daemon=True).start()
+
+        return Response(OrderDetailSerializer(order).data)
+
     # ── Product match ─────────────────────────────────────────────────────────
 
     @action(detail=True, methods=['post'], url_path='match')
@@ -853,11 +886,21 @@ class ProductionQueueView(generics.ListAPIView):
     filterset_fields = ('sub_user', 'store')
 
     def get_queryset(self):
+        # Orders already in a batch that is still being labeled/built are not up for
+        # selection again — otherwise they could land in two batches at once.
+        from apps.production.batch_flow import OPEN_BATCH_STATUSES
+        from apps.production.models import BatchOrder
+
+        in_open_batch = (
+            BatchOrder.objects.filter(batch__status__in=OPEN_BATCH_STATUSES)
+            .exclude(label_status=BatchOrder.LabelStatus.REMOVED)
+            .values('order_id')
+        )
         return (
             Order.objects.filter(
                 store__shipstation_account__print_center=self.request.user.print_center_profile,
                 status=Order.Status.SENT_TO_PRINT,
-            )
+            ).exclude(pk__in=in_open_batch)
             .select_related('store', 'sub_user__user')
             .prefetch_related('items')
             .order_by('created_at')

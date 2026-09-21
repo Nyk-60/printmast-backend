@@ -68,6 +68,10 @@ class Order(TimeStampedModel):
 
     # Label (filled after purchase)
     label_url = models.URLField(blank=True)
+    label_file = models.FileField(
+        upload_to='labels/', blank=True,
+        help_text="The provider's original label file (PDF/image), kept so the slip and a reprint never depend on the provider.",
+    )
     tracking_number = models.CharField(max_length=120, blank=True)
     shipstation_shipment_id = models.CharField(max_length=64, blank=True)
     label_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -157,6 +161,7 @@ class OrderEvent(TimeStampedModel):
         CANCELLED = 'cancelled', 'Cancelled'
         STATUS_SYNCED = 'status_synced', 'Status Synced from ShipStation'
         HIDDEN = 'hidden', 'Removed from Platform'
+        ADDRESS_EDITED = 'address_edited', 'Address Edited'
         SHIPSTATION_NOTIFIED = 'shipstation_notified', 'ShipStation Notified (Marketplace)'
         SHIPSTATION_NOTIFY_FAILED = 'shipstation_notify_failed', 'ShipStation Notify Failed'
 

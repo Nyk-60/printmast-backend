@@ -13,9 +13,10 @@ from urllib3.util.retry import Retry
 
 
 class ByeLabelError(Exception):
-    def __init__(self, message, status_code=None):
+    def __init__(self, message, status_code=None, code=''):
         super().__init__(message)
         self.status_code = status_code
+        self.code = code  # ByeLabel's own error code, e.g. VALIDATION_ERROR
 
 
 def _session_with_retries():
@@ -45,7 +46,7 @@ class ByeLabelClient:
             raise ByeLabelError(f'Non-JSON response ({r.status_code}): {r.text[:200]}', r.status_code)
         if not data.get('success'):
             err = data.get('error') or {}
-            raise ByeLabelError(err.get('message', 'Unknown ByeLabel error'), r.status_code)
+            raise ByeLabelError(err.get('message', 'Unknown ByeLabel error'), r.status_code, err.get('code', ''))
         return data
 
     def _login(self):
@@ -85,6 +86,21 @@ class ByeLabelClient:
             return False, str(e)
         except requests.exceptions.RequestException as e:
             return False, f'Network error: {e}'
+
+    # ── Account / shipments (read-only) ─────────────────────────────────────
+
+    def get_balance(self):
+        """[{currency, amount}] — the workspace's prepaid balance."""
+        return self._request('GET', '/balance')
+
+    def list_shipments(self, limit=50):
+        """Newest-first list of shipments (filters are not supported by the API).
+        Used to check whether a label purchase that timed out actually went through."""
+        return (self._request('GET', f'/shipment?limit={int(limit)}') or {}).get('data', [])
+
+    def get_shipment(self, shipment_id):
+        """Full shipment including label{format, data(base64)}."""
+        return self._request('GET', f'/shipment/{shipment_id}')
 
     # ── Carriers ─────────────────────────────────────────────────────────────
 
