@@ -72,11 +72,14 @@ def design_size_inches(item, design):
     """(width, height) in inches at which this design is printed; ValueError if the
     catalog does not say how big it should be.
 
-    The garment size decides it: PrintAreaSizeSpec gives the maximum print dimension
-    for a print area + size (an XL front prints bigger than an S front). The design's
-    own proportions are always kept — it is scaled, never stretched. Without a size
-    spec the print area's own width/height is used as a bounding box. A missing or
-    zero size is an error, never a guess: the result is what ends up on film.
+    The garment size decides it, per print area (an XL front prints bigger than an S front):
+    - "longest" areas (front, back, pocket, neck): PrintAreaSizeSpec.max_dim_in is the
+      design's longer side.
+    - "box" areas (sleeves): PrintAreaSizeSpec.max_width_in x max_height_in; the design grows
+      until it reaches the width or the height, whichever comes first.
+    The design's own proportions are always kept — it is scaled, never stretched. Without a
+    size spec the print area's own width/height is used as a bounding box. A missing or zero
+    size is an error, never a guess: the result is what ends up on film.
     """
     variant = item.pc_variant
     area = None
@@ -92,15 +95,23 @@ def design_size_inches(item, design):
             px_w, px_h = im.size
     ratio = px_w / px_h
 
-    spec = area.size_specs.filter(size__iexact=variant.size or '').first()
-    if spec is not None and float(spec.max_dim_in) > 0:
-        long_side = float(spec.max_dim_in)
-        return (long_side, long_side / ratio) if ratio >= 1 else (long_side * ratio, long_side)
-    if float(area.width_inches) > 0 and float(area.height_inches) > 0:
-        scale = min(float(area.width_inches) / px_w, float(area.height_inches) / px_h)
+    def fit_in_box(box_w, box_h):
+        scale = min(box_w / px_w, box_h / px_h)
         return px_w * scale, px_h * scale
+
+    spec = area.size_specs.filter(size__iexact=variant.size or '').first()
+    if spec is not None:
+        if area.size_mode == 'box':
+            if float(spec.max_width_in) > 0 and float(spec.max_height_in) > 0:
+                return fit_in_box(float(spec.max_width_in), float(spec.max_height_in))
+        elif float(spec.max_dim_in) > 0:
+            long_side = float(spec.max_dim_in)
+            return (long_side, long_side / ratio) if ratio >= 1 else (long_side * ratio, long_side)
+    if float(area.width_inches) > 0 and float(area.height_inches) > 0:
+        return fit_in_box(float(area.width_inches), float(area.height_inches))
+    what = 'width and height' if area.size_mode == 'box' else 'size'
     raise ValueError(
-        f'Print area "{design.print_area_name}" has no size for {variant.size or "this size"} in the '
+        f'Print area "{design.print_area_name}" has no {what} for {variant.size or "this size"} in the '
         'catalog — fill it in the print-area size grid.'
     )
 

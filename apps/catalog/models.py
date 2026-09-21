@@ -99,7 +99,7 @@ class ProductVariant(TimeStampedModel):
 
 class PrintArea(models.Model):
     product = models.ForeignKey(Product, related_name='print_areas', on_delete=models.CASCADE)
-    name = models.CharField(max_length=40, help_text='Front, Back, Left Sleeve, Right Sleeve, Left Chest, Collar')
+    name = models.CharField(max_length=40, help_text='Front, Back, Sleeve, Pocket, Neck')
     is_default = models.BooleanField(default=False)
     # Physical print dimensions in inches (used for gang sheet layout)
     width_inches = models.DecimalField(max_digits=6, decimal_places=2, default=0)
@@ -204,8 +204,18 @@ class VariantDimensionRule(models.Model):
         return f'{self.variant} qty {self.qty_min}–{max_str}: {self.length_in}×{self.width_in}×{self.height_in}"'
 
 
+def default_size_mode(name):
+    """Sleeves are sized by a width AND a height; every other area by one max dimension."""
+    return 'box' if 'sleeve' in (name or '').lower() else 'longest'
+
+
 class PrintCenterPrintArea(models.Model):
     """Print areas available for a print center's product."""
+
+    class SizeMode(models.TextChoices):
+        LONGEST = 'longest', 'One max dimension (longest side)'
+        BOX = 'box', 'Width × height'
+
     pc_product = models.ForeignKey(PrintCenterProduct, related_name='print_areas', on_delete=models.CASCADE)
     source_print_area = models.ForeignKey(
         PrintArea, related_name='pc_copies', on_delete=models.SET_NULL, null=True, blank=True
@@ -216,6 +226,7 @@ class PrintCenterPrintArea(models.Model):
     width_inches = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     height_inches = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     icon = models.ImageField(upload_to='print_areas/', blank=True, null=True)
+    size_mode = models.CharField(max_length=10, choices=SizeMode.choices, default=SizeMode.LONGEST)
 
     class Meta:
         unique_together = ('pc_product', 'name')
@@ -225,13 +236,22 @@ class PrintCenterPrintArea(models.Model):
 
 
 class PrintAreaSizeSpec(models.Model):
-    """Max print dimension (inches) for a specific print area + garment size combination."""
+    """Print size (inches) for a specific print area + garment size combination.
+
+    'longest' areas use max_dim_in (the design's longer side, aspect kept). 'box' areas
+    (sleeves) use max_width_in x max_height_in: the design is scaled, aspect kept, until
+    it hits the width or the height, whichever comes first.
+    """
     print_area = models.ForeignKey(PrintCenterPrintArea, related_name='size_specs', on_delete=models.CASCADE)
     size       = models.CharField(max_length=20)
     max_dim_in = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    max_width_in  = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    max_height_in = models.DecimalField(max_digits=5, decimal_places=2, default=0)
 
     class Meta:
         unique_together = ('print_area', 'size')
 
     def __str__(self):
+        if self.print_area.size_mode == PrintCenterPrintArea.SizeMode.BOX:
+            return f'{self.print_area} / {self.size}: {self.max_width_in}" x {self.max_height_in}"'
         return f'{self.print_area} / {self.size}: {self.max_dim_in}"'

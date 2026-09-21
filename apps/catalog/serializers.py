@@ -13,6 +13,7 @@ from .models import (
     ProductImage,
     ProductVariant,
     VariantDimensionRule,
+    default_size_mode,
 )
 
 
@@ -117,13 +118,19 @@ class ProductWriteSerializer(serializers.ModelSerializer):
 class PrintCenterPrintAreaSerializer(serializers.ModelSerializer):
     class Meta:
         model = PrintCenterPrintArea
-        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon')
+        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon', 'size_mode')
+        extra_kwargs = {'size_mode': {'required': False}}
+
+    def create(self, validated_data):
+        if 'size_mode' not in validated_data:
+            validated_data['size_mode'] = default_size_mode(validated_data.get('name'))
+        return super().create(validated_data)
 
 
 class PrintAreaSizeSpecSerializer(serializers.ModelSerializer):
     class Meta:
         model = PrintAreaSizeSpec
-        fields = ('id', 'print_area', 'size', 'max_dim_in')
+        fields = ('id', 'print_area', 'size', 'max_dim_in', 'max_width_in', 'max_height_in')
 
 
 class VariantDimensionRuleSerializer(serializers.ModelSerializer):

@@ -26,6 +26,7 @@ from .models import (
     Product,
     ProductVariant,
     VariantDimensionRule,
+    default_size_mode,
 )
 from .serializers import (
     AdoptProductSerializer,
@@ -228,6 +229,7 @@ class ProductViewSet(viewsets.ModelViewSet):
                 is_default=area.is_default,
                 width_inches=area.width_inches,
                 height_inches=area.height_inches,
+                size_mode=default_size_mode(area.name),
             )
 
         return Response(PrintCenterProductDetailSerializer(pc_product).data, status=status.HTTP_201_CREATED)
@@ -392,7 +394,11 @@ class PrintAreaDimsView(APIView):
             PrintAreaSizeSpec.objects.update_or_create(
                 print_area_id=item['print_area'],
                 size=item['size'],
-                defaults={'max_dim_in': item.get('max_dim_in') or 0},
+                defaults={
+                    'max_dim_in':    item.get('max_dim_in') or 0,
+                    'max_width_in':  item.get('max_width_in') or 0,
+                    'max_height_in': item.get('max_height_in') or 0,
+                },
             )
             saved += 1
         return Response({'saved': saved})
