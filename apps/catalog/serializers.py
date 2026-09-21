@@ -118,13 +118,45 @@ class ProductWriteSerializer(serializers.ModelSerializer):
 class PrintCenterPrintAreaSerializer(serializers.ModelSerializer):
     class Meta:
         model = PrintCenterPrintArea
-        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon', 'size_mode')
+        fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon',
+                  'size_mode', 'size_from')
         extra_kwargs = {'size_mode': {'required': False}}
+
+    def validate_size_from(self, target):
+        if target is None:
+            return target
+        view = self.context.get('view')
+        product_id = int(view.kwargs['pk']) if view is not None else None
+        if product_id is not None and target.pc_product_id != product_id:
+            raise serializers.ValidationError('Pick a print area of the same product.')
+        if target.size_from_id:
+            raise serializers.ValidationError('That area takes its sizes from another area.')
+        if self.instance is not None:
+            if target.pk == self.instance.pk:
+                raise serializers.ValidationError('An area cannot take its sizes from itself.')
+            if self.instance.size_followers.exists():
+                raise serializers.ValidationError('Other areas take their sizes from this one.')
+        return target
 
     def create(self, validated_data):
         if 'size_mode' not in validated_data:
             validated_data['size_mode'] = default_size_mode(validated_data.get('name'))
-        return super().create(validated_data)
+        area = super().create(validated_data)
+        if area.size_from_id:
+            area.size_mode = area.size_from.size_mode
+            area.save(update_fields=['size_mode'])
+        else:
+            area.link_to_counterpart()
+            area.refresh_from_db()
+        return area
+
+    def update(self, instance, validated_data):
+        area = super().update(instance, validated_data)
+        if area.size_from_id and area.size_mode != area.size_from.size_mode:
+            area.size_mode = area.size_from.size_mode          # a follower always uses its owner's mode
+            area.save(update_fields=['size_mode'])
+        area.size_followers.exclude(size_mode=area.size_mode).update(size_mode=area.size_mode)
+        return area
 
 
 class PrintAreaSizeSpecSerializer(serializers.ModelSerializer):

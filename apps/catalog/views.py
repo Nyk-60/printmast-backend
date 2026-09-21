@@ -221,8 +221,9 @@ class ProductViewSet(viewsets.ModelViewSet):
         areas_qs = product.print_areas.all()
         if area_ids:
             areas_qs = areas_qs.filter(id__in=area_ids)
+        created_areas = []
         for area in areas_qs:
-            PrintCenterPrintArea.objects.create(
+            created_areas.append(PrintCenterPrintArea.objects.create(
                 pc_product=pc_product,
                 source_print_area=area,
                 name=area.name,
@@ -230,7 +231,9 @@ class ProductViewSet(viewsets.ModelViewSet):
                 width_inches=area.width_inches,
                 height_inches=area.height_inches,
                 size_mode=default_size_mode(area.name),
-            )
+            ))
+        for area in created_areas:
+            area.link_to_counterpart()
 
         return Response(PrintCenterProductDetailSerializer(pc_product).data, status=status.HTTP_201_CREATED)
 
@@ -386,7 +389,8 @@ class PrintAreaDimsView(APIView):
 
     def post(self, request, pk):
         product = self._get_product(request, pk)
-        area_ids = set(product.print_areas.values_list('id', flat=True))
+        # areas that take their sizes from another area (right sleeve) have no grid of their own
+        area_ids = set(product.print_areas.filter(size_from__isnull=True).values_list('id', flat=True))
         saved = 0
         for item in request.data:
             if int(item.get('print_area', 0)) not in area_ids:

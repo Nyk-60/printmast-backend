@@ -99,7 +99,7 @@ class ProductVariant(TimeStampedModel):
 
 class PrintArea(models.Model):
     product = models.ForeignKey(Product, related_name='print_areas', on_delete=models.CASCADE)
-    name = models.CharField(max_length=40, help_text='Front, Back, Sleeve, Pocket, Neck')
+    name = models.CharField(max_length=40, help_text='Front, Back, Left Sleeve, Right Sleeve, Pocket, Neck')
     is_default = models.BooleanField(default=False)
     # Physical print dimensions in inches (used for gang sheet layout)
     width_inches = models.DecimalField(max_digits=6, decimal_places=2, default=0)
@@ -209,6 +209,15 @@ def default_size_mode(name):
     return 'box' if 'sleeve' in (name or '').lower() else 'longest'
 
 
+def counterpart_name(name):
+    """'Right Sleeve' <-> 'Left Sleeve'; None when the name has no left/right twin."""
+    n = (name or '').strip()
+    for a, b in (('right', 'left'), ('left', 'right')):
+        if n.lower().startswith(a + ' '):
+            return b.capitalize() + n[len(a):]
+    return None
+
+
 class PrintCenterPrintArea(models.Model):
     """Print areas available for a print center's product."""
 
@@ -227,9 +236,35 @@ class PrintCenterPrintArea(models.Model):
     height_inches = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     icon = models.ImageField(upload_to='print_areas/', blank=True, null=True)
     size_mode = models.CharField(max_length=10, choices=SizeMode.choices, default=SizeMode.LONGEST)
+    # Left and right sleeve are picked separately but are the same size: the follower has no
+    # size grid of its own and uses the sizes (and size mode) of the area it points to.
+    size_from = models.ForeignKey(
+        'self', related_name='size_followers', on_delete=models.SET_NULL, null=True, blank=True,
+    )
 
     class Meta:
         unique_together = ('pc_product', 'name')
+
+    @property
+    def sizing_area(self):
+        """The area whose size grid applies to this one."""
+        return self.size_from or self
+
+    def link_to_counterpart(self):
+        """Left/Right twins share one size grid; the first one created owns it."""
+        twin_name = counterpart_name(self.name)
+        if not twin_name or self.size_from_id or self.size_followers.exists():
+            return
+        twin = PrintCenterPrintArea.objects.filter(pc_product_id=self.pc_product_id, name=twin_name).first()
+        if twin is None or twin.size_from_id:
+            return
+        if twin.name.lower().startswith('left'):
+            owner, follower = twin, self
+        else:
+            owner, follower = self, twin
+        follower.size_from = owner
+        follower.size_mode = owner.size_mode
+        follower.save(update_fields=['size_from', 'size_mode'])
 
     def __str__(self):
         return f'{self.pc_product.name} — {self.name}'
