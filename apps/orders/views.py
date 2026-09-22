@@ -472,6 +472,61 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         order.save(update_fields=['selected_carrier_code', 'selected_service_code', 'shipping_cost'])
         return Response(OrderDetailSerializer(order).data)
 
+    @action(detail=True, methods=['patch'], url_path='shipping-category')
+    def set_shipping_category(self, request, pk=None):
+        """Manually upgrade/downgrade the shipping speed (Standard/Priority/Express)
+        for one order — either the owning sub-user or the print center can do this
+        (get_object() already scopes to whichever the requester actually owns).
+
+        Purely internal: never changes requested_service, so ShipStation/the
+        marketplace still shows whatever the customer actually ordered. Clears the
+        current selection so a fresh rate for the new category is picked right away.
+        """
+        order = self.get_object()
+
+        if order.status not in self.NEW_ORDER_STATUSES:
+            return Response(
+                {'detail': 'Shipping can only be changed before the order is sent to print.'},
+                status=400,
+            )
+
+        category = request.data.get('category') or ''
+        if category and category not in dict(Order.ShippingCategory.choices):
+            return Response({'detail': f'Unknown category "{category}".'}, status=400)
+
+        order.shipping_category_override = category
+        order.selected_carrier_code = ''
+        order.selected_service_code = ''
+        order.shipping_cost = None
+        order.shipping_cost_raw = None
+        order.save(update_fields=[
+            'shipping_category_override', 'selected_carrier_code', 'selected_service_code',
+            'shipping_cost', 'shipping_cost_raw',
+        ])
+        log_event(
+            order, OrderEvent.EventType.SHIPPING_CATEGORY_CHANGED, actor=request.user,
+            description=f'Shipping category set to "{category or "default"}"',
+        )
+
+        # Pick a fresh rate for the new category right away instead of leaving the
+        # order rate-less until the sub-user happens to reopen the rate dropdown.
+        import logging
+        import threading
+
+        def _reselect():
+            from django.db import close_old_connections
+            close_old_connections()
+            from apps.shipping.tasks import auto_select_shipping_for_order
+            try:
+                auto_select_shipping_for_order(order.pk)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    'Auto-select after shipping-category change failed for order %s', order.pk,
+                )
+        threading.Thread(target=_reselect, daemon=True).start()
+
+        return Response(OrderDetailSerializer(order).data)
+
     # ── Send to print ─────────────────────────────────────────────────────────
 
     @action(detail=True, methods=['post'], url_path='send-to-print')

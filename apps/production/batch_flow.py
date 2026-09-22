@@ -160,7 +160,7 @@ def preflight(orders, sheet_width_in=22.0, margin_in=0.2) -> Dict:
     """
     from apps.orders.models import Order
     from apps.shipping.models import LabelProviderAccount, ShippingServiceOption
-    from apps.shipping.utils import categorize_requested_service, get_order_shipping_config, sanitize_label_text
+    from apps.shipping.utils import effective_shipping_category, get_order_shipping_config, sanitize_label_text
 
     orders = list(orders)
     open_ids = orders_in_open_batches([o.id for o in orders])
@@ -213,7 +213,7 @@ def preflight(orders, sheet_width_in=22.0, margin_in=0.2) -> Dict:
         if not order.selected_carrier_code or order.shipping_cost is None:
             found.append(('error', 'no_shipping_selected', 'No shipping method/price was selected for this order.'))
 
-        category = categorize_requested_service(order.requested_service)
+        category = effective_shipping_category(order)
         if not any(o.category == category and o.provider in accounts for o in options):
             found.append((
                 'error', 'no_shipping_option',

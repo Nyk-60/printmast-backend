@@ -175,6 +175,7 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
     shipping_dims_auto    = serializers.SerializerMethodField()
     default_shipping_option = serializers.SerializerMethodField()
     selected_service_name   = serializers.SerializerMethodField()
+    shipping_category        = serializers.SerializerMethodField()
     item_cost             = serializers.SerializerMethodField()
     extra_print_area_fee  = serializers.SerializerMethodField()
 
@@ -190,12 +191,20 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
             'ship_by_date', 'ordered_at',
             'requested_service', 'shipping_cost', 'status',
             'selected_carrier_code', 'selected_service_code', 'selected_service_name',
+            'shipping_category_override', 'shipping_category',
             'buyer_note', 'gift_message', 'is_gift', 'internal_note',
             'tracking_number', 'label_url',
             'shipping_override', 'shipping_dims_auto', 'default_shipping_option',
             'unmatched_count', 'has_design', 'items',
             'item_cost', 'extra_print_area_fee',
         )
+
+    def get_shipping_category(self, obj):
+        """The category actually in effect (the manual override if set, else whatever
+        the marketplace's requested_service maps to) — for the UI to show e.g. a
+        'Priority' badge regardless of which drove it."""
+        from apps.shipping.utils import effective_shipping_category
+        return effective_shipping_category(obj)
 
     def get_sub_user_name(self, obj):
         if not obj.sub_user_id:
@@ -229,12 +238,12 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
         """The sub-user's configured default shipping option for this order's
         requested-service category — shown as a preview before rates are fetched."""
         from apps.shipping.models import ShippingServiceDefault
-        from apps.shipping.utils import categorize_requested_service
+        from apps.shipping.utils import effective_shipping_category
 
         if not obj.sub_user_id:
             return None
 
-        category = categorize_requested_service(obj.requested_service)
+        category = effective_shipping_category(obj)
         cache = self.context.setdefault('_default_shipping_cache', {})
         key = (obj.sub_user_id, category)
         if key not in cache:
@@ -282,6 +291,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
     store_name  = serializers.CharField(source='store.name', read_only=True)
     marketplace = serializers.CharField(source='store.marketplace', read_only=True)
     shipping_dims_auto   = serializers.SerializerMethodField()
+    shipping_category    = serializers.SerializerMethodField()
     item_cost            = serializers.SerializerMethodField()
     extra_print_area_fee = serializers.SerializerMethodField()
 
@@ -296,6 +306,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country', 'ship_to_phone',
             'address_verified', 'address_status', 'ship_by_date', 'ordered_at',
             'requested_service', 'selected_carrier_code', 'selected_service_code',
+            'shipping_category_override', 'shipping_category',
             'shipping_cost', 'tracking_number', 'label_url',
             'buyer_note', 'print_note', 'status',
             'shipping_override', 'shipping_dims_auto',
@@ -317,6 +328,10 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             }
         except Exception:
             return None
+
+    def get_shipping_category(self, obj):
+        from apps.shipping.utils import effective_shipping_category
+        return effective_shipping_category(obj)
 
 
 class OrderEventSerializer(serializers.ModelSerializer):

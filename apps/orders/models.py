@@ -60,8 +60,20 @@ class Order(TimeStampedModel):
     ordered_at = models.DateTimeField(null=True, blank=True)
     ship_by_date = models.DateField(null=True, blank=True)
 
+    class ShippingCategory(models.TextChoices):
+        STANDARD = 'standard', 'Standard'
+        PRIORITY = 'priority', 'Priority'
+        EXPRESS = 'express', 'Express'
+
     # Shipping
     requested_service = models.CharField(max_length=200, blank=True)  # raw from marketplace
+    # A sub-user or the print center manually upgrading/downgrading the shipping speed
+    # (e.g. Standard -> Priority). Blank = use whatever categorize_requested_service()
+    # derives from requested_service, as before. Purely internal: never pushed back to
+    # ShipStation/the marketplace, which still shows what the customer actually paid for.
+    shipping_category_override = models.CharField(
+        max_length=10, choices=ShippingCategory.choices, blank=True,
+    )
     selected_carrier_code = models.CharField(max_length=80, blank=True)   # e.g. "stamps_com"
     selected_service_code = models.CharField(max_length=80, blank=True)   # e.g. "usps_ground_advantage"
     shipping_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -163,6 +175,7 @@ class OrderEvent(TimeStampedModel):
         STATUS_SYNCED = 'status_synced', 'Status Synced from ShipStation'
         HIDDEN = 'hidden', 'Removed from Platform'
         ADDRESS_EDITED = 'address_edited', 'Address Edited'
+        SHIPPING_CATEGORY_CHANGED = 'shipping_category_changed', 'Shipping Category Changed'
         SHIPSTATION_NOTIFIED = 'shipstation_notified', 'ShipStation Notified (Marketplace)'
         SHIPSTATION_NOTIFY_FAILED = 'shipstation_notify_failed', 'ShipStation Notify Failed'
 

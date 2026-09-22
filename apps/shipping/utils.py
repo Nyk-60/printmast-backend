@@ -197,6 +197,19 @@ def categorize_requested_service(requested_service):
     return 'standard'
 
 
+def effective_shipping_category(order):
+    """The category actually used for rate-shopping/purchase for this order.
+
+    A sub-user or the print center can manually upgrade/downgrade the shipping
+    speed (Order.shipping_category_override) — e.g. a Standard order the sub-user
+    decides to rush as Priority. When set, it wins over whatever
+    categorize_requested_service() would derive from the marketplace's own
+    requested_service string. The override is purely internal to this platform:
+    it is never reported back to ShipStation/the marketplace.
+    """
+    return order.shipping_category_override or categorize_requested_service(order.requested_service)
+
+
 def get_fixed_shipping_price(print_center, category, weight_oz):
     """Look up the print center's flat shipping price for this category/weight.
 

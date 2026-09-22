@@ -161,10 +161,10 @@ def shop_rates_for_order(order, weight_oz, dimensions):
     Returns the cheapest {account, provider, carrier_code, service_code,
     service_name, cost} dict, or None if nothing is available.
     """
-    from .utils import categorize_requested_service
+    from .utils import effective_shipping_category
 
     pc = order.store.shipstation_account.print_center
-    category = categorize_requested_service(order.requested_service)
+    category = effective_shipping_category(order)
     quotes = shop_all_rates(
         pc, order.store, category,
         to_postal=order.ship_to_postal_code, to_country=order.ship_to_country,

@@ -591,8 +591,8 @@ class RatesView(APIView):
             )
         pc = account.print_center
 
-        from .utils import categorize_requested_service, real_service_key
-        category = categorize_requested_service(order.requested_service if order else '')
+        from .utils import categorize_requested_service, effective_shipping_category, real_service_key
+        category = effective_shipping_category(order) if order else categorize_requested_service('')
 
         if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
             from .utils import get_fixed_shipping_price

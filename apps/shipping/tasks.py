@@ -464,7 +464,7 @@ def auto_select_shipping_for_order(self, order_id):
     from apps.orders.models import Order
     from apps.shipping.models import ShippingServiceDefault, ShippingServiceOption
     from apps.shipping.utils import (
-        categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config,
+        effective_shipping_category, get_fixed_shipping_price, get_order_shipping_config,
     )
 
     try:
@@ -481,7 +481,7 @@ def auto_select_shipping_for_order(self, order_id):
         return
 
     pc = order.store.shipstation_account.print_center
-    category = categorize_requested_service(order.requested_service)
+    category = effective_shipping_category(order)
 
     if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
         weight_oz, _ = get_order_shipping_config(order)
@@ -576,7 +576,7 @@ def refresh_shipping_rate_for_order(self, order_id):
     """
     from apps.accounts.models import PrintCenterProfile
     from apps.orders.models import Order
-    from apps.shipping.utils import categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config
+    from apps.shipping.utils import effective_shipping_category, get_fixed_shipping_price, get_order_shipping_config
 
     try:
         order = (
@@ -597,9 +597,9 @@ def refresh_shipping_rate_for_order(self, order_id):
         return
 
     pc = order.store.shipstation_account.print_center
+    category = effective_shipping_category(order)
 
     if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
-        category = categorize_requested_service(order.requested_service)
         price = get_fixed_shipping_price(pc, category, weight_oz)
         if price is None:
             return
@@ -614,7 +614,6 @@ def refresh_shipping_rate_for_order(self, order_id):
     # ShipStation directly because the selection may have come from any active provider.
     from .services import shop_all_rates
 
-    category = categorize_requested_service(order.requested_service)
     quotes = shop_all_rates(
         pc, order.store, category,
         to_postal=order.ship_to_postal_code, to_country=order.ship_to_country,
