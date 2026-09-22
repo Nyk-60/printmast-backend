@@ -185,7 +185,7 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
             'customer_name', 'store', 'store_name', 'sub_user_name',
             'ship_to_name', 'ship_to_company',
             'ship_to_address1', 'ship_to_address2',
-            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country',
+            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country', 'ship_to_phone',
             'address_verified', 'address_status',
             'ship_by_date', 'ordered_at',
             'requested_service', 'shipping_cost', 'status',
@@ -282,7 +282,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             'store', 'store_name', 'marketplace',
             'ship_to_name', 'ship_to_company',
             'ship_to_address1', 'ship_to_address2',
-            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country',
+            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country', 'ship_to_phone',
             'address_verified', 'address_status', 'ship_by_date', 'ordered_at',
             'requested_service', 'selected_carrier_code', 'selected_service_code',
             'shipping_cost', 'tracking_number', 'label_url',
@@ -348,7 +348,7 @@ class AddressUpdateSerializer(serializers.ModelSerializer):
         fields = (
             'ship_to_name', 'ship_to_company',
             'ship_to_address1', 'ship_to_address2',
-            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country',
+            'ship_to_city', 'ship_to_state', 'ship_to_postal_code', 'ship_to_country', 'ship_to_phone',
         )
 
 

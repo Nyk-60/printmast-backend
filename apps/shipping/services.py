@@ -23,7 +23,7 @@ def _order_ship_to_address(order):
     return {
         'name': clean(order.ship_to_name),
         'company': clean(order.ship_to_company),
-        'phone': '',
+        'phone': clean(order.ship_to_phone) or '0000000000',
         'street1': clean(order.ship_to_address1),
         'street2': clean(order.ship_to_address2),
         'city': clean(order.ship_to_city),

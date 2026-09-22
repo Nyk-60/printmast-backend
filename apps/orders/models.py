@@ -40,6 +40,7 @@ class Order(TimeStampedModel):
     ship_to_state = models.CharField(max_length=80, blank=True)
     ship_to_postal_code = models.CharField(max_length=20)
     ship_to_country = models.CharField(max_length=2, default='US')
+    ship_to_phone = models.CharField(max_length=30, blank=True)
     address_verified = models.BooleanField(default=False)  # True only when address_status == validated
 
     class AddressStatus(models.TextChoices):

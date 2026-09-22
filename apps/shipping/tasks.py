@@ -210,6 +210,7 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
                 'ship_to_state': ship_to.get('state') or '',
                 'ship_to_postal_code': ship_to.get('postalCode') or '',
                 'ship_to_country': ship_to.get('country') or 'US',
+                'ship_to_phone': ship_to.get('phone') or '',
                 'address_status': map_address_status(ship_to.get('addressVerified')),
                 'address_verified': map_address_status(ship_to.get('addressVerified')) == 'validated',
                 'requested_service': raw.get('requestedShippingService') or '',
