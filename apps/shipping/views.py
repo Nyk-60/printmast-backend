@@ -8,7 +8,7 @@ from apps.accounts.models import PrintCenterProfile, SubUserProfile
 from apps.accounts.permissions import IsPrintCenter
 
 from .byelabel_client import ByeLabelClient
-from .client import ShipStationClient, ShipStationError
+from .client import ShipStationClient
 from .models import (
     FixedShippingRate,
     LabelProviderAccount,
@@ -582,7 +582,6 @@ class RatesView(APIView):
             return Response({'detail': 'No active store assigned'}, status=400)
 
         account = store.shipstation_account
-        client = ShipStationClient(account)
 
         if not store.ship_from_configured:
             return Response(
@@ -591,7 +590,6 @@ class RatesView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         pc = account.print_center
-        from_postal = store.ship_from_postal_code
 
         from .utils import categorize_requested_service
         category = categorize_requested_service(order.requested_service if order else '')
@@ -617,37 +615,31 @@ class RatesView(APIView):
                 'is_default': True,
             }]})
 
-        try:
-            rates = client.get_rates(
-                from_postal=from_postal,
-                to_postal=data['ship_to_postal_code'],
-                to_country=data['ship_to_country'],
-                weight_oz=data['weight_oz'],
-                carrier_code=data.get('carrier_code') or None,
-                dimensions=dimensions,
-            )
-        except ShipStationError as e:
-            return Response({'detail': str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        # Compare every active provider (ShipStation, ByeLabel, ...) the print center has
+        # configured for this category — not just ShipStation — so the price shown to the
+        # sub-user before send-to-print already reflects whichever is actually cheapest.
+        from .services import shop_all_rates
 
-        # Keep only the ShipStation services the print center has configured, deduplicate
-        # by serviceCode (cheapest wins). This is the displayed pre-send-to-print rate —
-        # which provider actually buys the label is a separate, later comparison.
-        allowed_services = set(
-            ShippingServiceOption.objects.filter(
-                print_center=pc, is_active=True, provider='shipstation',
-            ).values_list('service_code', flat=True)
+        quotes = shop_all_rates(
+            pc, store, category,
+            to_postal=data['ship_to_postal_code'], to_country=data['ship_to_country'],
+            weight_oz=data['weight_oz'], dimensions=dimensions,
+            carrier_code=data.get('carrier_code') or None,
+            label=f"order {order_id or 'n/a'} / sub-user {sub_profile.id}",
         )
-        seen, deduped = {}, []
-        for r in rates:
-            code = r.get('serviceCode')
-            if code not in allowed_services:
-                continue
-            cost = float(r.get('shipmentCost', 0)) + float(r.get('otherCost', 0))
-            if code not in seen or cost < seen[code]:
-                seen[code] = cost
-                deduped = [x for x in deduped if x.get('serviceCode') != code]
-                deduped.append(r)
-        rates = deduped
+        if not quotes:
+            return Response(
+                {'detail': 'No rate could be quoted for this address/weight from any configured provider.'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # Cheapest wins per (carrier, service) — providers never share a carrier/service
+        # code today, so this only dedupes the rare case of a provider quoting twice.
+        best_by_key = {}
+        for q in quotes:
+            key = (q['carrier_code'], q['service_code'])
+            if key not in best_by_key or q['cost'] < best_by_key[key]['cost']:
+                best_by_key[key] = q
 
         # Apply sub-user shipping markup
         markup_type = sub_profile.shipping_markup_type
@@ -656,21 +648,25 @@ class RatesView(APIView):
         default = ShippingServiceDefault.objects.filter(
             sub_user=sub_profile, category=category, service_option__isnull=False,
         ).select_related('service_option').first()
-        default_codes = {default.service_option.service_code} if default else set()
+        default_key = (
+            (default.service_option.carrier_code, default.service_option.service_code)
+            if default else None
+        )
         result = []
-        for r in rates:
-            base = float(r.get('shipmentCost', 0)) + float(r.get('otherCost', 0))
+        for q in best_by_key.values():
+            base = q['cost']
             if markup_type == 'percent':
                 displayed = base * (1 + markup_value / 100)
             else:
                 displayed = base + markup_value
             result.append({
-                'carrier_code': r.get('carrierCode'),
-                'service_code': r.get('serviceCode'),
-                'service_name': r.get('serviceName'),
+                'carrier_code': q['carrier_code'],
+                'service_code': q['service_code'],
+                'service_name': q['service_name'],
+                'provider': q['provider'],
                 'base_rate': round(base, 2),
                 'displayed_rate': round(displayed, 2),
-                'is_default': r.get('serviceCode') in default_codes,
+                'is_default': (q['carrier_code'], q['service_code']) == default_key,
             })
 
         result.sort(key=lambda r: r['displayed_rate'])

@@ -75,33 +75,35 @@ def _group_by_provider(options):
     return groups
 
 
-def shop_rates_for_order(order, weight_oz, dimensions):
-    """Compare rates across every active provider for this PC, restricted to
-    the (carrier, service) combos allowed for the order's service category.
+def shop_all_rates(pc, store, category, *, to_postal, to_country, weight_oz, dimensions,
+                    carrier_code=None, label=''):
+    """Every rate quote across every active provider for this PC, restricted to the
+    (carrier, service) combos allowed for that service category.
 
-    Returns the cheapest {account, provider, carrier_code, service_code,
-    service_name, cost} dict, or None if nothing is available.
+    Used both for the real, money-spending purchase decision (shop_rates_for_order)
+    and for the price shown to the sub-user BEFORE send-to-print (RatesView, the
+    auto-select and refresh tasks) — so the displayed/charged price already reflects
+    whichever provider is actually cheapest, not just ShipStation.
+
+    Returns a list of {account, provider, carrier_code, service_code, service_name,
+    cost}, cheapest first. A provider erroring out (no rates for the route, bad
+    credentials, timeout, ...) is skipped, not fatal — the other provider's quotes
+    still come back. `label` only identifies what was being rate-shopped in the log
+    line (an order id, or a sub-user's default-rate check).
     """
     from .byelabel_client import ByeLabelClient, ByeLabelError
     from .client import ShipStationClient, ShipStationError
     from .models import LabelProviderAccount, ShippingServiceOption
-    from .utils import categorize_requested_service
-
-    pc = order.store.shipstation_account.print_center
-    category = categorize_requested_service(order.requested_service)
 
     options = list(ShippingServiceOption.objects.filter(
         print_center=pc, category=category, is_active=True,
     ))
     if not options:
-        return None
+        return []
 
-    if not order.store.ship_from_configured:
-        logger.warning(
-            'No ship-from address synced for store %s (order %s) — cannot rate-shop.',
-            order.store_id, order.id,
-        )
-        return None
+    if not store.ship_from_configured:
+        logger.warning('No ship-from address synced for store %s (%s) — cannot rate-shop.', store.id, label)
+        return []
 
     # One active account per provider is compared (a print center connecting
     # two accounts of the same provider is not a supported case yet).
@@ -109,9 +111,9 @@ def shop_rates_for_order(order, weight_oz, dimensions):
         a.provider: a for a in
         LabelProviderAccount.objects.filter(print_center=pc, is_active=True)
     }
-    from_postal = order.store.ship_from_postal_code
+    from_postal = store.ship_from_postal_code
 
-    best = None
+    quotes = []
     for provider_key, provider_options in _group_by_provider(options).items():
         account = accounts.get(provider_key)
         if not account:
@@ -128,11 +130,11 @@ def shop_rates_for_order(order, weight_oz, dimensions):
             else:
                 continue
             rates = client.get_rates(
-                from_postal=from_postal, to_postal=order.ship_to_postal_code,
-                to_country=order.ship_to_country or 'US', weight_oz=weight_oz, dimensions=dimensions,
+                from_postal=from_postal, to_postal=to_postal, to_country=to_country or 'US',
+                weight_oz=weight_oz, dimensions=dimensions, carrier_code=carrier_code,
             )
         except (ShipStationError, ByeLabelError) as exc:
-            logger.warning('Rate fetch failed for provider %s on order %s: %s', provider_key, order.id, exc)
+            logger.warning('Rate fetch failed for provider %s (%s): %s', provider_key, label, exc)
             continue
 
         for r in rates:
@@ -140,13 +142,33 @@ def shop_rates_for_order(order, weight_oz, dimensions):
             if key not in allowed:
                 continue
             cost = float(r.get('shipmentCost') or 0) + float(r.get('otherCost') or 0)
-            if best is None or cost < best['cost']:
-                best = {
-                    'account': account, 'provider': provider_key,
-                    'carrier_code': key[0], 'service_code': key[1],
-                    'service_name': r.get('serviceName'), 'cost': cost,
-                }
-    return best
+            quotes.append({
+                'account': account, 'provider': provider_key,
+                'carrier_code': key[0], 'service_code': key[1],
+                'service_name': r.get('serviceName'), 'cost': cost,
+            })
+
+    quotes.sort(key=lambda q: q['cost'])
+    return quotes
+
+
+def shop_rates_for_order(order, weight_oz, dimensions):
+    """Compare rates across every active provider for this PC, restricted to
+    the (carrier, service) combos allowed for the order's service category.
+
+    Returns the cheapest {account, provider, carrier_code, service_code,
+    service_name, cost} dict, or None if nothing is available.
+    """
+    from .utils import categorize_requested_service
+
+    pc = order.store.shipstation_account.print_center
+    category = categorize_requested_service(order.requested_service)
+    quotes = shop_all_rates(
+        pc, order.store, category,
+        to_postal=order.ship_to_postal_code, to_country=order.ship_to_country,
+        weight_oz=weight_oz, dimensions=dimensions, label=f'order {order.id}',
+    )
+    return quotes[0] if quotes else None
 
 
 class LabelOutcomeUnknown(Exception):

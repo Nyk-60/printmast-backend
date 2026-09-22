@@ -466,7 +466,6 @@ def auto_select_shipping_for_order(self, order_id):
     from apps.shipping.utils import (
         categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config,
     )
-    from .client import ShipStationClient, ShipStationError
 
     try:
         order = (
@@ -494,13 +493,11 @@ def auto_select_shipping_for_order(self, order_id):
         _apply_shipping_selection(order, 'fixed', category, float(price))
         return
 
-    # This picks a displayed ShipStation rate ahead of send-to-print — the
-    # cross-provider comparison at actual label-purchase time (see
-    # apps/shipping/services.py) is a separate, later step.
-    options = list(ShippingServiceOption.objects.filter(
-        print_center=pc, category=category, is_active=True, provider='shipstation',
-    ))
-    if not options:
+    # This picks the displayed rate ahead of send-to-print — comparing every active
+    # provider (ShipStation, ByeLabel, ...), same as the real purchase-time comparison
+    # (apps/shipping/services.py) does later, so what the sub-user is charged already
+    # reflects whoever is actually cheapest.
+    if not ShippingServiceOption.objects.filter(print_center=pc, category=category, is_active=True).exists():
         return  # PC hasn't configured this category — leave for manual selection
 
     if not order.store.ship_from_configured:
@@ -510,32 +507,22 @@ def auto_select_shipping_for_order(self, order_id):
     if not weight_oz:
         return
 
-    client = ShipStationClient(order.store.shipstation_account)
-    from_postal = order.store.ship_from_postal_code
-    try:
-        rates = client.get_rates(
-            from_postal=from_postal,
-            to_postal=order.ship_to_postal_code,
-            to_country=order.ship_to_country or 'US',
-            weight_oz=weight_oz,
-            dimensions=dimensions,
-        )
-    except ShipStationError as exc:
-        raise self.retry(exc=exc)
+    from .services import shop_all_rates
 
-    # Cheapest rate per (carrier, service), restricted to the PC's options for this category
-    allowed = {(o.carrier_code, o.service_code) for o in options}
+    quotes = shop_all_rates(
+        pc, order.store, category,
+        to_postal=order.ship_to_postal_code, to_country=order.ship_to_country,
+        weight_oz=weight_oz, dimensions=dimensions, label=f'order {order.id} auto-select',
+    )
+    if not quotes:
+        return  # no provider could quote this route right now — leave for manual selection
+
+    # Cheapest quote per (carrier, service)
     best = {}
-    for r in rates:
-        key = (r.get('carrierCode'), r.get('serviceCode'))
-        if key not in allowed:
-            continue
-        cost = float(r.get('shipmentCost', 0)) + float(r.get('otherCost', 0))
-        if key not in best or cost < best[key]:
-            best[key] = cost
-
-    if not best:
-        return
+    for q in quotes:
+        key = (q['carrier_code'], q['service_code'])
+        if key not in best or q['cost'] < best[key]:
+            best[key] = q['cost']
 
     default = ShippingServiceDefault.objects.filter(
         sub_user=order.sub_user, category=category
@@ -588,7 +575,6 @@ def refresh_shipping_rate_for_order(self, order_id):
     from apps.accounts.models import PrintCenterProfile
     from apps.orders.models import Order
     from apps.shipping.utils import categorize_requested_service, get_fixed_shipping_price, get_order_shipping_config
-    from .client import ShipStationClient, ShipStationError
 
     try:
         order = (
@@ -621,25 +607,23 @@ def refresh_shipping_rate_for_order(self, order_id):
     if not order.store.ship_from_configured:
         return  # store has no synced ship-from address yet — nothing to refresh against
 
-    client = ShipStationClient(order.store.shipstation_account)
-    from_postal = order.store.ship_from_postal_code
-    try:
-        rates = client.get_rates(
-            from_postal=from_postal,
-            to_postal=order.ship_to_postal_code,
-            to_country=order.ship_to_country or 'US',
-            weight_oz=weight_oz,
-            dimensions=dimensions,
-            carrier_code=order.selected_carrier_code,
-        )
-    except ShipStationError as exc:
-        raise self.retry(exc=exc)
+    # Re-quote the SAME carrier/service already selected (this task keeps a chosen rate's
+    # price fresh — it does not re-shop). shop_all_rates is used rather than calling
+    # ShipStation directly because the selection may have come from any active provider.
+    from .services import shop_all_rates
 
-    match = next((r for r in rates if r.get('serviceCode') == order.selected_service_code), None)
+    category = categorize_requested_service(order.requested_service)
+    quotes = shop_all_rates(
+        pc, order.store, category,
+        to_postal=order.ship_to_postal_code, to_country=order.ship_to_country,
+        weight_oz=weight_oz, dimensions=dimensions,
+        carrier_code=order.selected_carrier_code, label=f'order {order.id} refresh',
+    )
+    match = next((q for q in quotes if q['service_code'] == order.selected_service_code), None)
     if not match:
         return
 
-    base_cost = float(match.get('shipmentCost', 0)) + float(match.get('otherCost', 0))
+    base_cost = match['cost']
 
     sub_profile = order.sub_user
     markup_type = sub_profile.shipping_markup_type
