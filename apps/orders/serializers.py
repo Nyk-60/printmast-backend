@@ -205,19 +205,23 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
 
     def get_selected_service_name(self, obj):
         """Friendly display name for the selected carrier/service, as configured
-        by the print center in Shipping Settings — falls back to a formatted code."""
+        by the print center in Shipping Settings — falls back to a formatted code.
+
+        Never the raw name of the exact (carrier_code, service_code) row: that row
+        may be a provider-specific account (e.g. ByeLabel's own USPS account) whose
+        configured name was typed for the PC's own bookkeeping and could mention
+        the provider — which backend fulfills a shipment must stay invisible to the
+        sub-user. customer_facing_service_name looks across every option offering
+        the same real-world service and prefers a name that doesn't."""
         if not obj.selected_carrier_code or not obj.selected_service_code:
             return None
 
-        from apps.shipping.models import ShippingServiceOption
+        from apps.shipping.utils import customer_facing_service_name
 
         cache = self.context.setdefault('_service_name_cache', {})
         key = (obj.store.shipstation_account.print_center_id, obj.selected_carrier_code, obj.selected_service_code)
         if key not in cache:
-            opt = ShippingServiceOption.objects.filter(
-                print_center_id=key[0], carrier_code=key[1], service_code=key[2],
-            ).first()
-            cache[key] = opt.service_name if opt and opt.service_name else None
+            cache[key] = customer_facing_service_name(*key)
 
         return cache[key] or obj.selected_service_code.replace('_', ' ').title()
 
@@ -242,10 +246,17 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
         opt = cache[key]
         if not opt:
             return None
+
+        from apps.shipping.utils import customer_facing_service_name
+
+        pc_id = obj.store.shipstation_account.print_center_id
         return {
             'carrier_code': opt.carrier_code,
             'service_code': opt.service_code,
-            'service_name': opt.service_name,
+            'service_name': (
+                customer_facing_service_name(pc_id, opt.carrier_code, opt.service_code)
+                or opt.service_name
+            ),
         }
 
     def get_shipping_dims_auto(self, obj):

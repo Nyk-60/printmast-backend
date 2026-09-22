@@ -150,6 +150,40 @@ def real_service_key(carrier_code, service_code):
     return (carrier, service)
 
 
+# Words that must never reach the sub-user — which backend account fulfills a
+# shipment (ShipStation vs ByeLabel vs any future provider) is the print center's own
+# business arrangement, not something a print center's customer should see.
+_PROVIDER_NAME_HINTS = ('byelabel', 'shipstation')
+
+
+def customer_facing_service_name(print_center_id, carrier_code, service_code):
+    """A shipping option's display name, safe to show a sub-user.
+
+    An option's own `service_name` is admin-typed and, for a provider-specific
+    account (e.g. one naming a ByeLabel row for the PC's own bookkeeping), may
+    accidentally mention that provider. Since two providers can quote the exact
+    same real-world service (see real_service_key), this looks across every
+    option for that print center offering the same real service and prefers
+    whichever configured name does NOT mention a provider by name — a data-entry
+    slip on one option's name does not have to leak through this order.
+
+    Returns None if nothing is configured (caller falls back to a formatted code).
+    """
+    from .models import ShippingServiceOption
+
+    if not carrier_code or not service_code:
+        return None
+    target_key = real_service_key(carrier_code, service_code)
+    named = [
+        o.service_name for o in ShippingServiceOption.objects.filter(
+            print_center_id=print_center_id, is_active=True,
+        )
+        if o.service_name and real_service_key(o.carrier_code, o.service_code) == target_key
+    ]
+    clean = next((n for n in named if not any(h in n.lower() for h in _PROVIDER_NAME_HINTS)), None)
+    return clean or (named[0] if named else None)
+
+
 def categorize_requested_service(requested_service):
     """Map a marketplace requested_service string to a ShippingServiceOption category.
 
