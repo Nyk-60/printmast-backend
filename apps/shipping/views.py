@@ -591,7 +591,7 @@ class RatesView(APIView):
             )
         pc = account.print_center
 
-        from .utils import categorize_requested_service
+        from .utils import categorize_requested_service, real_service_key
         category = categorize_requested_service(order.requested_service if order else '')
 
         if pc.shipping_pricing_mode == PrintCenterProfile.ShippingPricingMode.FIXED:
@@ -633,11 +633,14 @@ class RatesView(APIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        # Cheapest wins per (carrier, service) — providers never share a carrier/service
-        # code today, so this only dedupes the rare case of a provider quoting twice.
+        # Collapse to one line per REAL-WORLD service: ShipStation's stamps_com account
+        # and ByeLabel's own usps account can both quote "USPS Ground Advantage" at
+        # different prices — the sub-user should see that once (whichever is cheaper),
+        # not two confusingly near-identical, differently priced lines. Different real
+        # carriers/services (USPS vs UPS) are never merged (see real_service_key).
         best_by_key = {}
         for q in quotes:
-            key = (q['carrier_code'], q['service_code'])
+            key = q['real_key']
             if key not in best_by_key or q['cost'] < best_by_key[key]['cost']:
                 best_by_key[key] = q
 
@@ -649,7 +652,7 @@ class RatesView(APIView):
             sub_user=sub_profile, category=category, service_option__isnull=False,
         ).select_related('service_option').first()
         default_key = (
-            (default.service_option.carrier_code, default.service_option.service_code)
+            real_service_key(default.service_option.carrier_code, default.service_option.service_code)
             if default else None
         )
         result = []
@@ -666,7 +669,7 @@ class RatesView(APIView):
                 'provider': q['provider'],
                 'base_rate': round(base, 2),
                 'displayed_rate': round(displayed, 2),
-                'is_default': (q['carrier_code'], q['service_code']) == default_key,
+                'is_default': q['real_key'] == default_key,
             })
 
         result.sort(key=lambda r: r['displayed_rate'])

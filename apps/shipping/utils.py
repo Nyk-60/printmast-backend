@@ -122,6 +122,34 @@ def sanitize_label_text(value):
     return text
 
 
+# Reseller/account carrier codes that are really the same underlying carrier — e.g.
+# ShipStation quotes USPS through its 'stamps_com' integration while ByeLabel quotes
+# the identical USPS product through its own 'usps' account. To the sub-user these are
+# not two different shipping choices, just two accounts buying the same real service.
+_CARRIER_ALIASES = {
+    'stamps_com': 'usps', 'usps': 'usps', 'endicia': 'usps',
+    'ups': 'ups', 'ups_walleted': 'ups',
+    'fedex': 'fedex', 'fedex_walleted': 'fedex',
+    'dhl_express': 'dhl',
+}
+
+
+def real_service_key(carrier_code, service_code):
+    """Collapse a (carrier_code, service_code) pair to the real-world service it
+    represents, independent of which provider/account quoted it.
+
+    Used to dedupe rate quotes shown to the sub-user: ShipStation's stamps_com
+    account and ByeLabel's own USPS account can both quote "USPS Ground
+    Advantage" at different prices — the sub-user should see that ONE product
+    once (whichever account is cheaper right now), not two near-identical,
+    confusingly priced lines. Different real carriers/services (USPS vs UPS)
+    still return different keys and are never merged.
+    """
+    carrier = _CARRIER_ALIASES.get((carrier_code or '').lower(), (carrier_code or '').lower())
+    service = ''.join(ch for ch in (service_code or '').lower() if ch.isalnum())
+    return (carrier, service)
+
+
 def categorize_requested_service(requested_service):
     """Map a marketplace requested_service string to a ShippingServiceOption category.
 

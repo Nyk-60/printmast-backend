@@ -94,6 +94,7 @@ def shop_all_rates(pc, store, category, *, to_postal, to_country, weight_oz, dim
     from .byelabel_client import ByeLabelClient, ByeLabelError
     from .client import ShipStationClient, ShipStationError
     from .models import LabelProviderAccount, ShippingServiceOption
+    from .utils import real_service_key
 
     options = list(ShippingServiceOption.objects.filter(
         print_center=pc, category=category, is_active=True,
@@ -146,6 +147,7 @@ def shop_all_rates(pc, store, category, *, to_postal, to_country, weight_oz, dim
                 'account': account, 'provider': provider_key,
                 'carrier_code': key[0], 'service_code': key[1],
                 'service_name': r.get('serviceName'), 'cost': cost,
+                'real_key': real_service_key(*key),
             })
 
     quotes.sort(key=lambda q: q['cost'])

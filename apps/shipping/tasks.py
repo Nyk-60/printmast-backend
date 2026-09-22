@@ -517,27 +517,29 @@ def auto_select_shipping_for_order(self, order_id):
     if not quotes:
         return  # no provider could quote this route right now — leave for manual selection
 
-    # Cheapest quote per (carrier, service)
+    # Cheapest quote per REAL-WORLD service — ShipStation's stamps_com account and
+    # ByeLabel's own usps account can both quote "USPS Ground Advantage"; only the
+    # cheaper of the two should ever be picked (see real_service_key).
+    from .utils import real_service_key
+
     best = {}
     for q in quotes:
-        key = (q['carrier_code'], q['service_code'])
-        if key not in best or q['cost'] < best[key]:
-            best[key] = q['cost']
+        key = q['real_key']
+        if key not in best or q['cost'] < best[key]['cost']:
+            best[key] = q
 
     default = ShippingServiceDefault.objects.filter(
         sub_user=order.sub_user, category=category
     ).select_related('service_option').first()
 
-    chosen_key = None
+    chosen = None
     if default and default.service_option:
-        candidate = (default.service_option.carrier_code, default.service_option.service_code)
-        if candidate in best:
-            chosen_key = candidate
-    if chosen_key is None:
-        chosen_key = min(best, key=best.get)
+        candidate = real_service_key(default.service_option.carrier_code, default.service_option.service_code)
+        chosen = best.get(candidate)
+    if chosen is None:
+        chosen = min(best.values(), key=lambda q: q['cost'])
 
-    base_cost = best[chosen_key]
-    _apply_shipping_selection(order, chosen_key[0], chosen_key[1], base_cost)
+    _apply_shipping_selection(order, chosen['carrier_code'], chosen['service_code'], chosen['cost'])
 
 
 def _apply_shipping_selection(order, carrier_code, service_code, base_cost):
