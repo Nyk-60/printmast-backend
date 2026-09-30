@@ -84,7 +84,19 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         sub_user = getattr(request.user, 'sub_user_profile', None) if request else None
         if not sub_user:
-            return []
+            # A read-only viewer (the print center) doesn't get the sub-user's editable
+            # design library — just the design(s) actually attached to this order item,
+            # exactly as they'll be (or were) printed. These stay on the order for its
+            # whole life — new, in production, shipped, even delivered — unless the
+            # sub-user explicitly removes one; nothing here depends on order status.
+            result = []
+            for d in obj.designs.all():
+                file_url = request.build_absolute_uri(d.file.url) if (request and d.file) else (d.file.url if d.file else None)
+                result.append({
+                    'id': d.pk, 'print_area_name': d.print_area_name,
+                    'file': file_url, 'file_name': d.file_name, 'is_matched': True,
+                })
+            return result
 
         sku_designs = list(
             SkuDesign.objects.filter(sub_user=sub_user, sku=obj.marketplace_sku)

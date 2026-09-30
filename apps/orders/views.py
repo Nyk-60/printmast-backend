@@ -75,7 +75,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
                     is_hidden=False,
                 )
                 .select_related('store', 'sub_user__user')
-                .prefetch_related('items__pc_variant__pc_product')
+                .prefetch_related('items__pc_variant__pc_product', 'items__designs')
             )
         else:
             return Order.objects.none()
