@@ -247,27 +247,20 @@ def auto_match_design(order_item, actor=None) -> int:
                 order_item.order, 'design_uploaded', actor=actor,
                 description=f'{order_item.raw_product_name} — {area.name}: {design.file_name}',
             )
-            # An independent physical COPY, not a shared reference to the SkuDesign's
-            # own file: the library entry can later be edited or deleted (the sub-user
-            # swaps or removes a reusable design), and this order's own record — what
-            # was actually matched and printed — must never change or disappear because
-            # of that. Print centers rely on it surviving to settle "I never uploaded
-            # that" disputes on orders that are long since completed.
-            import os
-
-            from django.core.files.base import ContentFile
-
-            oid = OrderItemDesign(
+            # Shares the SkuDesign's own physical file (cheap — a design reused across
+            # many orders costs no extra storage per order) rather than copying it.
+            # Safe because nothing ever physically deletes a design file while another
+            # row still points at it — see designs.models.file_in_use(), used by the
+            # library/order design delete endpoints.
+            OrderItemDesign.objects.create(
                 order_item=order_item,
                 print_area_name=area.name,
+                file=design.file,
                 file_name=design.file_name,
                 width_px=design.width_px,
                 height_px=design.height_px,
                 sku_design=design,
             )
-            with design.file.open('rb') as fh:
-                oid.file.save(os.path.basename(design.file.name), ContentFile(fh.read()), save=False)
-            oid.save()
             matched += 1
 
     return matched

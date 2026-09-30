@@ -416,7 +416,12 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             order, OrderEvent.EventType.DESIGN_REMOVED, actor=request.user,
             description=f'{item.raw_product_name} — {design.print_area_name}',
         )
-        if design.file:
+        # The file may be shared with a SkuDesign library entry, or with another
+        # order that auto-matched the same design (see designs.models.file_in_use) —
+        # only remove the bytes once nothing else still points at them.
+        from apps.designs.models import file_in_use
+
+        if design.file and not file_in_use(design.file.name, exclude_order_item_design_id=design.pk):
             design.file.delete(save=False)
         design.delete()
         self._refresh_order_status(order, actor=request.user)
@@ -440,7 +445,13 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
             description=f'Library design removed: {sku_design.file_name}',
         )
 
-        if sku_design.file:
+        # Other orders may have auto-matched this exact design before this one removed
+        # it — their OrderItemDesign rows share the same physical file (see
+        # designs.models.file_in_use) and must keep working. Only delete the bytes
+        # once nothing else still references them.
+        from apps.designs.models import file_in_use
+
+        if sku_design.file and not file_in_use(sku_design.file.name, exclude_sku_design_id=sku_design.pk):
             sku_design.file.delete(save=False)
         sku_design.delete()
 

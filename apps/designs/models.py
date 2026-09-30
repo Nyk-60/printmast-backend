@@ -79,6 +79,32 @@ class SkuDesign(TimeStampedModel):
         return f'{self.sku} / {self.print_area_name} [{self.color_scope}]'
 
 
+def file_in_use(file_name, *, exclude_sku_design_id=None, exclude_order_item_design_id=None):
+    """Is this exact stored file path still referenced by any OTHER design row?
+
+    auto_match_design() gives an OrderItemDesign the SAME physical file as the
+    SkuDesign it matched, rather than a copy — reusing one design across many
+    orders costs no extra storage per order. That sharing is only safe if a
+    delete NEVER removes the bytes while another row still points at them: a
+    print center relies on an already-matched order's design surviving even
+    after the sub-user edits or deletes the reusable library entry, to settle
+    "I never uploaded that" disputes on orders completed long ago. Callers
+    must check this before physically deleting a design file, excluding only
+    the very row being deleted.
+    """
+    if not file_name:
+        return False
+    oid_qs = OrderItemDesign.objects.filter(file=file_name)
+    if exclude_order_item_design_id:
+        oid_qs = oid_qs.exclude(pk=exclude_order_item_design_id)
+    if oid_qs.exists():
+        return True
+    sd_qs = SkuDesign.objects.filter(file=file_name)
+    if exclude_sku_design_id:
+        sd_qs = sd_qs.exclude(pk=exclude_sku_design_id)
+    return sd_qs.exists()
+
+
 class OrderItemDesign(TimeStampedModel):
     """
     Design assigned to a specific order item + print area.
