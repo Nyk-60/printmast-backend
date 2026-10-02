@@ -62,7 +62,7 @@ class ProductionBatchListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductionBatch
-        fields = ('id', 'status', 'sheet_length_inches', 'note', 'error_message',
+        fields = ('id', 'name', 'status', 'sheet_length_inches', 'note', 'error_message',
                   'paused_reason', 'counts', 'created_at')
         read_only_fields = fields
 
@@ -79,7 +79,7 @@ class ProductionBatchSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionBatch
         fields = (
-            'id', 'status', 'sheet_length_inches', 'gang_sheet_dpi',
+            'id', 'name', 'status', 'sheet_length_inches', 'gang_sheet_dpi',
             'margin_inches', 'note', 'error_message', 'paused_reason', 'counts',
             'batch_orders', 'gang_sheets', 'slip_pdfs', 'created_at',
         )
@@ -92,6 +92,7 @@ class ProductionBatchSerializer(serializers.ModelSerializer):
 
 class CreateBatchSerializer(serializers.Serializer):
     order_ids = serializers.ListField(child=serializers.IntegerField(), min_length=1)
+    name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
     sheet_length_inches = serializers.ChoiceField(
         choices=[100, 200, 250, 300, 350, 400], default=200
     )

@@ -21,6 +21,10 @@ class ProductionBatch(TimeStampedModel):
     created_by = models.ForeignKey(
         'accounts.User', related_name='batches', on_delete=models.PROTECT
     )
+    name = models.CharField(
+        max_length=120, blank=True,
+        help_text='e.g. "Oct 1 orders — Part 1" — shown in the batch list; distinct from `note`.',
+    )
     sheet_length_inches = models.PositiveIntegerField(
         choices=SHEET_LENGTH_CHOICES, default=200
     )

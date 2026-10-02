@@ -86,6 +86,7 @@ class BatchListCreateView(APIView):
         with transaction.atomic():
             batch = ProductionBatch.objects.create(
                 print_center=pc, created_by=request.user,
+                name=data.get('name', ''),
                 sheet_length_inches=data['sheet_length_inches'],
                 gang_sheet_dpi=data['gang_sheet_dpi'],
                 margin_inches=data['margin_inches'],

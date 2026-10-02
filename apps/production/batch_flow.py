@@ -420,6 +420,17 @@ def run_layout(batch_id: int):
         dpi = batch.gang_sheet_dpi
         max_len = float(batch.sheet_length_inches)
 
+        # Express/Priority orders are packed first (earlier sheets, earlier in the cut
+        # sequence) so the press gets to them sooner — a rush order sitting behind 200
+        # Standard ones on the last sheet would defeat the point of paying for it.
+        from apps.shipping.utils import effective_shipping_category
+
+        _CATEGORY_RANK = {'express': 0, 'priority': 1, 'standard': 2}
+        priority_by_order = {
+            bo.order_id: _CATEGORY_RANK.get(effective_shipping_category(bo.order), 2)
+            for bo in batch_orders
+        }
+
         designs, rects = {}, []
         for bo in batch_orders:
             for item in bo.order.items.all():
@@ -430,7 +441,7 @@ def run_layout(batch_id: int):
                         width_in, height_in = design_size_inches(item, design)
                     except ValueError as exc:
                         raise RuntimeError(f'Order {bo.order.shipstation_order_number}: {exc}') from exc
-                    rects.append((design.id, bo.order_id, width_in, height_in))
+                    rects.append((design.id, bo.order_id, width_in, height_in, priority_by_order[bo.order_id]))
                     designs[design.id] = design
         if not rects:
             raise RuntimeError('The labeled orders have no designs to print.')
