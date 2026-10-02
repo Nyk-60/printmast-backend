@@ -98,8 +98,18 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
                 })
             return result
 
+        # Only designs that COULD legitimately apply to this item's own personalization —
+        # mirrors _find_sku_design's exact-match gate (personalization_match must equal
+        # this item's normalized text). Without this, a fully custom SKU (e.g. a custom-
+        # photo listing) would surface some unrelated past customer's design here just
+        # because it shares a SKU, which is actively misleading, not a helpful suggestion.
+        from apps.orders.services import _normalize_personalization
+
+        norm = _normalize_personalization(obj.personalization or '')
         sku_designs = list(
-            SkuDesign.objects.filter(sub_user=sub_user, sku=obj.marketplace_sku)
+            SkuDesign.objects.filter(
+                sub_user=sub_user, sku=obj.marketplace_sku, personalization_match=norm,
+            )
             .order_by('print_area_name', 'color_scope')
         )
 
