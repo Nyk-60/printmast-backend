@@ -66,7 +66,7 @@ class SkuDesignSerializer(serializers.ModelSerializer):
     class Meta:
         model = SkuDesign
         fields = (
-            'id', 'sku', 'print_area_name', 'color_scope', 'specific_color', 'personalization_match',
+            'id', 'store', 'sku', 'print_area_name', 'color_scope', 'specific_color', 'personalization_match',
             'file', 'file_name', 'width_px', 'height_px', 'created_at',
         )
         read_only_fields = ('id', 'file_name', 'width_px', 'height_px', 'created_at')
@@ -160,6 +160,9 @@ class OrderItemDesignSerializer(serializers.ModelSerializer):
         if save_to_library:
             order_item = self.context['order_item']
             sub_user = self.context['sub_user']
+            # Same SKU, different store = a different, unrelated listing (a sub-user can run
+            # several stores) — never let this auto-apply across stores.
+            store = order_item.order.store
 
             if color_scope == SkuDesign.ColorScope.SPECIFIC:
                 colors = [c.strip() for c in specific_colors_raw.split(',') if c.strip()] \
@@ -171,6 +174,7 @@ class OrderItemDesignSerializer(serializers.ModelSerializer):
                         file.seek(0)
                     sd, _ = SkuDesign.objects.update_or_create(
                         sub_user=sub_user,
+                        store=store,
                         sku=order_item.marketplace_sku,
                         print_area_name=validated_data['print_area_name'],
                         color_scope=SkuDesign.ColorScope.SPECIFIC,
@@ -190,6 +194,7 @@ class OrderItemDesignSerializer(serializers.ModelSerializer):
                     file.seek(0)
                 sku_design, _ = SkuDesign.objects.update_or_create(
                     sub_user=sub_user,
+                    store=store,
                     sku=order_item.marketplace_sku,
                     print_area_name=validated_data['print_area_name'],
                     color_scope=color_scope,

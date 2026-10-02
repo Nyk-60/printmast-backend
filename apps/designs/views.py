@@ -15,7 +15,7 @@ def _sub_user(request):
 class SkuDesignListCreateView(generics.ListCreateAPIView):
     permission_classes = (IsAuthenticated,)
     serializer_class = SkuDesignSerializer
-    filterset_fields = ('sku', 'print_area_name', 'color_scope')
+    filterset_fields = ('sku', 'store', 'print_area_name', 'color_scope')
 
     def get_queryset(self):
         return SkuDesign.objects.filter(sub_user=_sub_user(self.request)).order_by('-created_at')

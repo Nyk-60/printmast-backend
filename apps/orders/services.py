@@ -210,6 +210,7 @@ def auto_match_design(order_item, actor=None) -> int:
         return 0
 
     sub_user = order_item.order.sub_user
+    store = order_item.order.store
     sku = order_item.marketplace_sku
     variant = order_item.pc_variant
     personalization = order_item.personalization
@@ -241,7 +242,7 @@ def auto_match_design(order_item, actor=None) -> int:
         ).exists():
             continue  # already has a design for this area
 
-        design = _find_sku_design(sub_user, sku, area.name, color_name, is_dark, personalization)
+        design = _find_sku_design(sub_user, store, sku, area.name, color_name, is_dark, personalization)
         if design:
             log_event(
                 order_item.order, 'design_uploaded', actor=actor,
@@ -266,19 +267,23 @@ def auto_match_design(order_item, actor=None) -> int:
     return matched
 
 
-def _find_sku_design(sub_user, sku, print_area_name, color_name, is_dark, personalization=''):
+def _find_sku_design(sub_user, store, sku, print_area_name, color_name, is_dark, personalization=''):
     """Priority: personalization match first, then SPECIFIC > DARK/LIGHT > ALL.
 
     If the item's personalization is non-empty, only designs whose
     personalization_match equals the normalized text are considered — no
     fallback to blank-personalization designs (deliberate: chart-based
     listings require an exact uploaded match).
+
+    Scoped to `store` as well as `sub_user`: a sub-user can run several stores,
+    each assigning its own SKUs independently, so the same SKU string in two
+    different stores can be a completely different, unrelated listing.
     """
     from apps.designs.models import SkuDesign
 
     norm = _normalize_personalization(personalization)
     qs = SkuDesign.objects.filter(
-        sub_user=sub_user, sku=sku, print_area_name=print_area_name, personalization_match=norm,
+        sub_user=sub_user, store=store, sku=sku, print_area_name=print_area_name, personalization_match=norm,
     )
 
     # 1. Specific color

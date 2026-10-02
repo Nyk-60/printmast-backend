@@ -55,6 +55,15 @@ class SkuDesign(TimeStampedModel):
     sub_user = models.ForeignKey(
         'accounts.SubUserProfile', related_name='sku_designs', on_delete=models.CASCADE
     )
+    # A sub-user can run several stores (e.g. several Etsy shops), and each store assigns
+    # its own SKUs independently — the same SKU string in two different stores can be a
+    # completely different, unrelated listing. Without this, a design saved for one store's
+    # "ABC0001" would wrongly auto-apply to another store's unrelated "ABC0001". Nullable
+    # only because a handful of rows created before this field existed have no recorded
+    # usage to infer it from — they simply never auto-match until re-saved.
+    store = models.ForeignKey(
+        'shipping.Store', related_name='sku_designs', on_delete=models.CASCADE, null=True, blank=True,
+    )
     sku = models.CharField(max_length=200, db_index=True)
     print_area_name = models.CharField(max_length=40)  # Front, Back, Left Sleeve…
     color_scope = models.CharField(max_length=8, choices=ColorScope.choices, default=ColorScope.ALL)
@@ -71,9 +80,9 @@ class SkuDesign(TimeStampedModel):
 
     class Meta:
         unique_together = (
-            'sub_user', 'sku', 'print_area_name', 'color_scope', 'specific_color', 'personalization_match',
+            'sub_user', 'store', 'sku', 'print_area_name', 'color_scope', 'specific_color', 'personalization_match',
         )
-        indexes = [models.Index(fields=['sub_user', 'sku', 'print_area_name'])]
+        indexes = [models.Index(fields=['sub_user', 'store', 'sku', 'print_area_name'])]
 
     def __str__(self):
         return f'{self.sku} / {self.print_area_name} [{self.color_scope}]'

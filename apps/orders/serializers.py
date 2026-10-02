@@ -108,7 +108,7 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
         norm = _normalize_personalization(obj.personalization or '')
         sku_designs = list(
             SkuDesign.objects.filter(
-                sub_user=sub_user, sku=obj.marketplace_sku, personalization_match=norm,
+                sub_user=sub_user, store=obj.order.store, sku=obj.marketplace_sku, personalization_match=norm,
             )
             .order_by('print_area_name', 'color_scope')
         )
@@ -121,7 +121,7 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
             areas = variant.pc_product.print_areas.filter(is_active=True).values_list('name', flat=True)
             for area_name in areas:
                 match = _find_sku_design(
-                    sub_user, obj.marketplace_sku, area_name,
+                    sub_user, obj.order.store, obj.marketplace_sku, area_name,
                     variant.color or '', variant.is_dark,
                     obj.personalization or '',
                 )
