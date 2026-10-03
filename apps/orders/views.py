@@ -35,6 +35,24 @@ def _get_sub_user(request):
     return getattr(request.user, 'sub_user_profile', None)
 
 
+def _exclude_open_batch_orders(qs):
+    """An order stays `sent_to_print` for its whole time in a batch — labels are bought
+    and sheets built before it ever flips to in_production — so without this it would
+    still look like it's sitting untouched in Ready for Print while a batch is actively
+    working on it (and could even be selected into a second batch; preflight would catch
+    that, but it shouldn't even look available). Used by the list, tab-counts, and
+    running-total endpoints so they all agree on what's actually still queued."""
+    from apps.production.batch_flow import OPEN_BATCH_STATUSES
+    from apps.production.models import BatchOrder
+
+    in_open_batch = (
+        BatchOrder.objects.filter(batch__status__in=OPEN_BATCH_STATUSES)
+        .exclude(label_status=BatchOrder.LabelStatus.REMOVED)
+        .values('order_id')
+    )
+    return qs.exclude(pk__in=in_open_batch)
+
+
 # ── Orders ────────────────────────────────────────────────────────────────────
 
 class OrderViewSet(viewsets.ReadOnlyModelViewSet):
@@ -84,7 +102,7 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         if tab in ('new_orders', 'active'):
             qs = qs.filter(status__in=self.NEW_ORDER_STATUSES)
         elif tab == 'ready_for_print':
-            qs = qs.filter(status__in=self.READY_FOR_PRINT_STATUSES)
+            qs = _exclude_open_batch_orders(qs.filter(status__in=self.READY_FOR_PRINT_STATUSES))
         elif tab == 'in_production':
             qs = qs.filter(status__in=self.IN_PRODUCTION_STATUSES)
         elif tab == 'completed':
@@ -142,7 +160,10 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         else:
             base_qs = Order.objects.none()
 
-        qs = self.filter_queryset(base_qs)
+        # An order in an open batch is always still `sent_to_print` (see
+        # _exclude_open_batch_orders) — safe to exclude globally here since no other
+        # status bucket could contain one.
+        qs = _exclude_open_batch_orders(self.filter_queryset(base_qs))
         counts = {row['status']: row['c'] for row in qs.values('status').annotate(c=Count('id'))}
 
         def total(statuses):
@@ -174,9 +195,9 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         else:
             base_qs = Order.objects.none()
 
-        qs = self.filter_queryset(
+        qs = _exclude_open_batch_orders(self.filter_queryset(
             base_qs.filter(status__in=self.READY_FOR_PRINT_STATUSES)
-        ).prefetch_related('items__pc_variant', 'items__designs')
+        )).prefetch_related('items__pc_variant', 'items__designs')
 
         count, total = 0, Decimal('0')
         for order in qs:
