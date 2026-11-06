@@ -52,6 +52,45 @@ def calculate_order_cost(order):
     return item_cost, extra_print_area_fee, shipping_cost, total
 
 
+def calculate_order_cost_lines(order):
+    """Per-charge-line breakdown used to write one BalanceTransaction per line
+    (one per billable item, one per extra-print-area fee, one for shipping),
+    instead of a single combined debit. Every amount here is an integer quantity
+    times a fixed-2-decimal-place price, so summing these lines always equals
+    calculate_order_cost(order)'s total exactly — no rounding reconciliation needed.
+    """
+    items = billable_items(order)
+    lines = []
+
+    sub_user = order.sub_user
+    extra_price = Decimal('0')
+    if sub_user and sub_user.extra_print_area_enabled:
+        extra_price = sub_user.extra_print_area_price or Decimal('0')
+
+    for item in items:
+        variant = item.pc_variant
+        line_cost = (variant.cost * item.quantity).quantize(_CENTS, rounding=ROUND_HALF_UP)
+        lines.append({
+            'category': 'fulfillment', 'amount': line_cost, 'quantity': item.quantity,
+            'product_name': variant.pc_product.name, 'size': variant.size, 'color': variant.color,
+        })
+        if extra_price > 0:
+            extra_units = max(0, item.designs.count() - 1) * item.quantity
+            if extra_units:
+                fee = (extra_units * extra_price).quantize(_CENTS, rounding=ROUND_HALF_UP)
+                lines.append({
+                    'category': 'extra_print', 'amount': fee, 'quantity': item.quantity,
+                    'product_name': variant.pc_product.name, 'size': variant.size, 'color': variant.color,
+                })
+
+    lines.append({
+        'category': 'shipping', 'amount': order.shipping_cost or Decimal('0'),
+        'product_name': f'{order.selected_carrier_code or ""} {order.selected_service_code or ""}'.strip(),
+        'size': '', 'color': '',
+    })
+    return lines
+
+
 def refund_order_debit(order, actor, description):
     """Refund whatever net amount is currently charged for this order, if any.
 
@@ -82,8 +121,10 @@ def refund_order_debit(order, actor, description):
         sub_user=sub_user,
         type=BalanceTransaction.Type.REFUND,
         amount=outstanding,
+        category='',  # refunds the order's full outstanding balance across all categories at once
         order=order,
         order_reference=order.shipstation_order_id,
+        order_number=order.shipstation_order_number or order.external_order_number,
         description=description,
         created_by=actor,
     )

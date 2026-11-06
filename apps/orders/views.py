@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import generics, status, viewsets
@@ -578,11 +580,15 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
 
         sub_user = request.user.sub_user_profile
 
-        from .services import calculate_order_cost
+        from .services import calculate_order_cost, calculate_order_cost_lines
         item_cost, extra_print_area_fee, shipping_cost, total_cost = calculate_order_cost(order)
 
-        # Check balance
-        if not sub_user.can_afford(total_cost):
+        # A PC-fault reship order is never billed to the sub-user — skip the
+        # balance check and zero every line below instead of charging the
+        # normal, freshly-computed cost. See apps/reship/services.py.
+        if order.is_free_reship:
+            total_cost = Decimal('0')
+        elif not sub_user.can_afford(total_cost):
             return Response({'detail': 'Insufficient balance'}, status=402)
 
         # Debit balance — the full order cost (product + extra print areas + shipping),
@@ -592,17 +598,34 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
         sub_user_locked.balance -= total_cost
         sub_user_locked.save(update_fields=['balance'])
 
-        BalanceTransaction.objects.create(
-            sub_user=sub_user_locked,
-            type=BalanceTransaction.Type.DEBIT,
-            amount=total_cost,
-            item_amount=item_cost + extra_print_area_fee,
-            shipping_amount=shipping_cost,
-            order=order,
-            order_reference=order.shipstation_order_id,
-            description=f'Order {order.shipstation_order_number} sent to print',
-            created_by=request.user,
-        )
+        order_number = order.shipstation_order_number or order.external_order_number
+
+        if order.is_free_reship:
+            from apps.reship.models import ReshipRequest
+            reship = ReshipRequest.objects.filter(new_order=order).first()
+            reason_label = reship.get_reason_display() if reship and reship.reason else 'a print center error'
+            description = f'Reshipment due to {reason_label}'
+        else:
+            description = f'Order {order.shipstation_order_number} sent to print'
+
+        for line in calculate_order_cost_lines(order):
+            is_shipping = line['category'] == 'shipping'
+            line_amount = Decimal('0') if order.is_free_reship else line['amount']
+            BalanceTransaction.objects.create(
+                sub_user=sub_user_locked,
+                type=BalanceTransaction.Type.DEBIT,
+                amount=line_amount,
+                item_amount=Decimal('0') if is_shipping else line_amount,
+                shipping_amount=line_amount if is_shipping else Decimal('0'),
+                category=line['category'],
+                quantity=line.get('quantity', 1),
+                product_name=line['product_name'], size=line['size'], color=line['color'],
+                order=order,
+                order_reference=order.shipstation_order_id,
+                order_number=order_number,
+                description=description,
+                created_by=request.user,
+            )
 
         order.status = Order.Status.SENT_TO_PRINT
         order.save(update_fields=['status'])
@@ -664,6 +687,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     def hide(self, request, pk=None):
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
+        if order.status not in self.NEW_ORDER_STATUSES:
+            return Response(
+                {'detail': 'An order that has already been sent to print can no longer be removed from the platform.'},
+                status=400,
+            )
         order.is_hidden = True
         order.save(update_fields=['is_hidden'])
         log_event(order, OrderEvent.EventType.HIDDEN, actor=request.user)
@@ -704,6 +732,11 @@ class OrderViewSet(viewsets.ReadOnlyModelViewSet):
     def update_gift(self, request, pk=None):
         order = self.get_object()
         self._assert_sub_user_owns(request, order)
+        if order.status not in self.NEW_ORDER_STATUSES:
+            return Response(
+                {'detail': 'Gift status can only be changed before the order is sent to print.'},
+                status=400,
+            )
         if 'is_gift' in request.data:
             order.is_gift = bool(request.data['is_gift'])
         if 'gift_message' in request.data:

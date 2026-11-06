@@ -9,9 +9,14 @@ from .views import (
     LoginView,
     LogoutView,
     MeView,
+    MyPrintCenterInvoiceListView,
     MyShippingRuleDeleteView,
     MyShippingRulesView,
     MyTransactionsView,
+    NotificationDetailView,
+    NotificationListView,
+    NotificationMarkAllReadView,
+    NotificationUnreadCountView,
     PrintCenterAnalyticsView,
     PrintCenterCreateView,
     PrintCenterDetailView,
@@ -51,6 +56,9 @@ urlpatterns = [
     path('superadmin/invoices/', InvoiceListView.as_view(), name='superadmin-invoices'),
     path('superadmin/invoices/<int:invoice_pk>/', InvoiceDetailView.as_view(), name='superadmin-invoice-detail'),
 
+    # Print Center — own invoices (from Super Admin)
+    path('print-center/invoices/', MyPrintCenterInvoiceListView.as_view(), name='pc-invoices'),
+
     # Print Center — shipping settings
     path('print-center/shipping-settings/', PCShippingSettingsView.as_view(), name='pc-shipping-settings'),
 
@@ -65,4 +73,10 @@ urlpatterns = [
     path('my/transactions/', MyTransactionsView.as_view(), name='my-transactions'),
     path('my/shipping-rules/', MyShippingRulesView.as_view(), name='my-shipping-rules'),
     path('my/shipping-rules/<int:rule_id>/', MyShippingRuleDeleteView.as_view(), name='my-shipping-rule-delete'),
+
+    # Notifications (any role)
+    path('notifications/', NotificationListView.as_view(), name='notifications'),
+    path('notifications/unread-count/', NotificationUnreadCountView.as_view(), name='notifications-unread-count'),
+    path('notifications/<int:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
+    path('notifications/mark-all-read/', NotificationMarkAllReadView.as_view(), name='notifications-mark-all-read'),
 ]

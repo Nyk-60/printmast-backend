@@ -366,6 +366,62 @@ class ShipStationClient:
             if payload:
                 return self._post(f'/orders/{order.shipstation_order_id}', json=payload)
 
+    def create_reship_order(self, order):
+        """Creates a brand-new ShipStation order for an approved reship.
+
+        Unlike update_order_address/update_item_personalization/
+        update_order_shipping_config above, this does NOT fetch-then-patch an
+        existing order — it omits `orderId` entirely so V1's createorder
+        endpoint treats the payload as new and returns a fresh `orderId`,
+        which the caller stores as this reship order's real
+        shipstation_order_id. V2 create-order isn't implemented — matches
+        the existing V1-only precedent set by the other three methods here.
+        """
+        if self._account.api_version != 'V1':
+            return None
+
+        items = [
+            {
+                'sku':        i.marketplace_sku or '',
+                'name':       i.raw_product_name or '',
+                'imageUrl':   i.image_url or '',
+                'quantity':   i.quantity,
+                'unitPrice':  float(i.unit_price),
+                'options':    [{'name': k, 'value': v} for k, v in (i.raw_options or {}).items()],
+                'adjustment': float(i.unit_price) < 0,
+            }
+            for i in order.items.all()
+        ]
+
+        raw = {
+            'orderNumber':      order.shipstation_order_number or order.external_order_number,
+            'orderDate':        order.ordered_at.isoformat() if order.ordered_at else None,
+            'orderStatus':      'awaiting_shipment',
+            'customerUsername': order.customer_email or order.customer_name,
+            'customerEmail':    order.customer_email,
+            'billTo':           {'name': order.ship_to_name},
+            'shipTo': {
+                'name':        order.ship_to_name,
+                'company':     order.ship_to_company,
+                'street1':     order.ship_to_address1,
+                'street2':     order.ship_to_address2,
+                'city':        order.ship_to_city,
+                'state':       order.ship_to_state,
+                'postalCode':  order.ship_to_postal_code,
+                'country':     order.ship_to_country or 'US',
+                'phone':       order.ship_to_phone,
+                'residential': True,
+            },
+            'items': items,
+        }
+        if order.store.shipstation_store_id:
+            raw['advancedOptions'] = {'storeId': int(order.store.shipstation_store_id)}
+        ship_from = self.build_ship_from(order)
+        if ship_from:
+            raw['shipFrom'] = ship_from
+
+        return self._post('/orders/createorder', json=raw)
+
     # ── Rates ────────────────────────────────────────────────────────────────
 
     def get_carriers(self):

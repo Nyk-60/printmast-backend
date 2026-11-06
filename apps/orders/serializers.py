@@ -3,6 +3,48 @@ from rest_framework import serializers
 from .models import Order, OrderEvent, OrderItem, ProductMapping
 
 
+def _get_reship_info(obj):
+    """Badge info for an order card: either the request that spawned this
+    order (if it IS a reship clone — in which case it can never be reshipped
+    again), or the most recent reship request made AGAINST this order (as the
+    original), plus whether it can still be reshipped again (capped at
+    MAX_RESHIP_REQUESTS_PER_ORDER). Shared by OrderListSerializer and
+    OrderDetailSerializer, and mirrors the same rule ReshipRequestCreateView
+    enforces server-side — this is only for the UI to hide the button
+    proactively, not the source of truth."""
+    from apps.reship.models import MAX_RESHIP_REQUESTS_PER_ORDER, ReshipRequest
+
+    spawning_req = ReshipRequest.objects.filter(new_order=obj).first()
+    if spawning_req:
+        return {
+            'role': 'reship',
+            'request_type': spawning_req.request_type,
+            'status': spawning_req.status,
+            'fault_type': spawning_req.fault_type,
+            'reason_display': spawning_req.get_reason_display() if spawning_req.reason else None,
+            'note': spawning_req.note,
+            'request_id': spawning_req.pk,
+            'can_reship_again': False,
+        }
+
+    qs = ReshipRequest.objects.filter(original_order=obj)
+    req = qs.order_by('-created_at').first()
+    if not req:
+        return None
+    active_count = qs.exclude(status=ReshipRequest.Status.REJECTED).count()
+    return {
+        'role': 'original',
+        'request_type': req.request_type,
+        'status': req.status,
+        'fault_type': req.fault_type,
+        'reason_display': req.get_reason_display() if req.reason else None,
+        'note': req.note,
+        'request_id': req.pk,
+        'refund_amount': req.refund_amount,
+        'can_reship_again': active_count < MAX_RESHIP_REQUESTS_PER_ORDER,
+    }
+
+
 class OrderItemSerializer(serializers.ModelSerializer):
     pc_variant_sku     = serializers.CharField(source='pc_variant.pc_product.sku', read_only=True)
     pc_variant_display = serializers.SerializerMethodField()
@@ -200,6 +242,7 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
     shipping_category        = serializers.SerializerMethodField()
     item_cost             = serializers.SerializerMethodField()
     extra_print_area_fee  = serializers.SerializerMethodField()
+    reship_info           = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -218,8 +261,11 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
             'tracking_number', 'label_url',
             'shipping_override', 'shipping_dims_auto', 'default_shipping_option',
             'unmatched_count', 'has_design', 'items',
-            'item_cost', 'extra_print_area_fee',
+            'item_cost', 'extra_print_area_fee', 'reship_info',
         )
+
+    def get_reship_info(self, obj):
+        return _get_reship_info(obj)
 
     def get_shipping_category(self, obj):
         """The category actually in effect (the manual override if set, else whatever
@@ -316,6 +362,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
     shipping_category    = serializers.SerializerMethodField()
     item_cost            = serializers.SerializerMethodField()
     extra_print_area_fee = serializers.SerializerMethodField()
+    reship_info          = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
@@ -330,10 +377,13 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             'requested_service', 'selected_carrier_code', 'selected_service_code',
             'shipping_category_override', 'shipping_category',
             'shipping_cost', 'tracking_number', 'label_url',
-            'buyer_note', 'print_note', 'status',
+            'buyer_note', 'print_note', 'status', 'reship_info',
             'shipping_override', 'shipping_dims_auto',
             'items', 'item_cost', 'extra_print_area_fee',
         )
+
+    def get_reship_info(self, obj):
+        return _get_reship_info(obj)
 
     def get_shipping_dims_auto(self, obj):
         """Auto-calculated weight + dims (always shown as reference, even when override is set)."""

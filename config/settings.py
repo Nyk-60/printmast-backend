@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'apps.payments',
     'apps.shipping',
     'apps.production',
+    'apps.reship',
 ]
 
 MIDDLEWARE = [
@@ -165,6 +166,8 @@ SHIPSTATION_BASE_URL = env('SHIPSTATION_BASE_URL', default='https://api.shipstat
 SITE_URL = env('SITE_URL', default='http://localhost:8000')
 
 # Celery
+from celery.schedules import crontab  # noqa: E402
+
 CELERY_BROKER_URL = env('REDIS_URL', default='redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_TIMEZONE = 'UTC'
@@ -174,5 +177,16 @@ CELERY_BEAT_SCHEDULE = {
     'sync-all-shipstation-accounts': {
         'task': 'apps.shipping.tasks.sync_all_active_accounts',
         'schedule': 600,  # every 10 minutes
+    },
+    # Monthly billing cycle: generate print-center + sub-user invoices for the
+    # month that just ended, and apply any pending timezone cutover.
+    'generate-monthly-invoices': {
+        'task': 'apps.accounts.tasks.generate_monthly_invoices',
+        'schedule': crontab(day_of_month=1, hour=0, minute=5),
+    },
+    # 5 days' grace period, then anything still unpaid becomes overdue.
+    'mark-overdue-invoices': {
+        'task': 'apps.accounts.tasks.mark_overdue_invoices',
+        'schedule': crontab(day_of_month=6, hour=0, minute=5),
     },
 }

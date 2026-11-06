@@ -110,6 +110,11 @@ class Order(TimeStampedModel):
         default=False, db_index=True,
         help_text='Removed from platform view by the sub-user. Not cancelled in ShipStation.',
     )
+    is_free_reship = models.BooleanField(
+        default=False,
+        help_text='A PC-fault reship order — send_to_print charges $0 for it instead of the '
+                  'normal cost. See apps/reship/services.py.',
+    )
 
     class Meta:
         ordering = ('-ordered_at', '-created_at')
@@ -178,6 +183,9 @@ class OrderEvent(TimeStampedModel):
         SHIPPING_CATEGORY_CHANGED = 'shipping_category_changed', 'Shipping Category Changed'
         SHIPSTATION_NOTIFIED = 'shipstation_notified', 'ShipStation Notified (Marketplace)'
         SHIPSTATION_NOTIFY_FAILED = 'shipstation_notify_failed', 'ShipStation Notify Failed'
+        RESHIP_REQUESTED = 'reship_requested', 'Reship Requested'
+        RESHIP_APPROVED = 'reship_approved', 'Reship Approved'
+        RESHIP_REJECTED = 'reship_rejected', 'Reship Rejected'
 
     order = models.ForeignKey(Order, related_name='events', on_delete=models.CASCADE)
     event_type = models.CharField(max_length=30, choices=EventType.choices)

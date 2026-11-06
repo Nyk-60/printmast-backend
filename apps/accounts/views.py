@@ -15,6 +15,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     BalanceTransaction,
     ImpersonationLog,
+    Notification,
     PrintCenterInvoice,
     PrintCenterPricingTier,
     PrintCenterProfile,
@@ -27,6 +28,7 @@ from .serializers import (
     BalanceTransactionSerializer,
     CreatePrintCenterSerializer,
     LoginSerializer,
+    NotificationSerializer,
     PrintCenterInvoiceSerializer,
     PrintCenterPricingTierSerializer,
     PrintCenterProfileSerializer,
@@ -107,6 +109,14 @@ class MeView(APIView):
                     update_fields.append(field)
             if update_fields:
                 profile.save(update_fields=update_fields)
+        elif user.is_print_center:
+            profile = user.print_center_profile
+            # A timezone change never applies immediately — it's queued and only
+            # takes effect when generate_monthly_invoices() runs on the 1st, so
+            # past transactions never shift retroactively.
+            if 'timezone' in request.data:
+                profile.pending_timezone = request.data['timezone']
+                profile.save(update_fields=['pending_timezone'])
 
         return Response(UserSerializer(user).data)
 
@@ -500,6 +510,25 @@ class PrintCenterPricingTierDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+# ── Print Center — own invoices (from Super Admin) ────────────────────────────
+
+class MyPrintCenterInvoiceListView(generics.ListAPIView):
+    """Read-only — a PC sees its own monthly_fee bills from Super Admin here,
+    mirroring MyInvoiceListView (a sub-user's own bills from its PC)."""
+    permission_classes = (IsPrintCenter,)
+    serializer_class = PrintCenterInvoiceSerializer
+
+    def get_queryset(self):
+        qs = PrintCenterInvoice.objects.filter(print_center=self.request.user.print_center_profile)
+        year = self.request.query_params.get('year')
+        month = self.request.query_params.get('month')
+        if year:
+            qs = qs.filter(period_year=year)
+        if month:
+            qs = qs.filter(period_month=month)
+        return qs
+
+
 # ── SuperAdmin — Invoices ─────────────────────────────────────────────────────
 
 class InvoiceListView(generics.ListAPIView):
@@ -619,6 +648,7 @@ class AddBalanceView(APIView):
         tx = BalanceTransaction.objects.create(
             sub_user=profile,
             type=BalanceTransaction.Type.CREDIT,
+            category=BalanceTransaction.Category.MANUAL_ADJUSTMENT,
             amount=amount,
             description=serializer.validated_data.get('description', ''),
             created_by=request.user,
@@ -676,4 +706,44 @@ class MyShippingRuleDeleteView(APIView):
         except Exception:
             raise NotFound()
         rule.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Notifications (any authenticated user — print center or sub-user) ─────────
+
+class NotificationListView(generics.ListAPIView):
+    permission_classes = (IsAuthenticated,)
+    serializer_class = NotificationSerializer
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user)
+
+
+class NotificationUnreadCountView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        count = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response({'count': count})
+
+
+class NotificationDetailView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def patch(self, request, pk):
+        try:
+            notif = Notification.objects.get(pk=pk, user=request.user)
+        except Notification.DoesNotExist:
+            raise NotFound()
+        if 'is_read' in request.data:
+            notif.is_read = bool(request.data['is_read'])
+            notif.save(update_fields=['is_read'])
+        return Response(NotificationSerializer(notif).data)
+
+
+class NotificationMarkAllReadView(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
         return Response(status=status.HTTP_204_NO_CONTENT)

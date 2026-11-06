@@ -1,6 +1,26 @@
 """Celery tasks for ShipStation sync."""
+from zoneinfo import ZoneInfo
+
 from celery import shared_task
 from django.utils import timezone
+
+# ShipStation returns order date/time fields (orderDate, createDate, etc.) as
+# naive strings with no offset — they're in whatever timezone the ShipStation
+# ACCOUNT itself is configured to (Account Settings → General → Time Zone in
+# ShipStation's own UI), never UTC and never the individual store/marketplace's
+# own local time. Confirmed for this account: Central Time (US & Canada).
+SHIPSTATION_ACCOUNT_TZ = ZoneInfo('America/Chicago')
+
+
+def _parse_shipstation_datetime(raw_str):
+    """Parse a naive ShipStation datetime string into an aware UTC-backed datetime,
+    correctly handling CST/CDT transitions via real IANA timezone rules (a fixed
+    offset would be wrong for half the year)."""
+    from django.utils.dateparse import parse_datetime
+    naive = parse_datetime(raw_str)
+    if naive is None:
+        return None
+    return naive.replace(tzinfo=SHIPSTATION_ACCOUNT_TZ)
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -152,8 +172,6 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
     update_only=True: only update status/tracking on orders already in our DB.
     client: ShipStationClient — used to fetch accurate tracking via /shipments.
     """
-    from django.utils.dateparse import parse_datetime
-
     from apps.orders.models import Order, OrderItem
 
     from .utils import map_address_status
@@ -218,7 +236,7 @@ def _upsert_orders(store, raw_orders, update_only=False, client=None):
                 'gift_message':  raw.get('giftMessage') or '',
                 'is_gift':       bool(raw.get('gift')),
                 'internal_note': raw.get('internalNotes') or '',
-                'ordered_at': parse_datetime(raw['orderDate']) if raw.get('orderDate') else None,
+                'ordered_at': _parse_shipstation_datetime(raw['orderDate']) if raw.get('orderDate') else None,
             }
             order, created = Order.objects.update_or_create(
                 store=store,
@@ -363,6 +381,31 @@ def push_address_to_shipstation(self, order_id):
         Order.objects.filter(pk=order.pk).update(
             address_status=status, address_verified=(status == 'validated'),
         )
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_reship_order_to_shipstation(self, order_id):
+    """Registers an approved reship as a real new ShipStation order (so the
+    customer gets a proper new tracking notification when it ships), and
+    replaces the order's placeholder shipstation_order_id with the real one
+    ShipStation returns. See apps/reship/services.py::_resolve_approved."""
+    from apps.orders.models import Order
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+    except Order.DoesNotExist:
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        result = client.create_reship_order(order)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+    new_id = result.get('orderId') if isinstance(result, dict) else None
+    if new_id:
+        Order.objects.filter(pk=order.pk).update(shipstation_order_id=str(new_id))
 
 
 @shared_task

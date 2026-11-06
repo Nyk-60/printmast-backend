@@ -8,10 +8,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     BalanceTransaction,
     ImpersonationLog,
+    Notification,
     PrintCenterInvoice,
     PrintCenterPricingTier,
     PrintCenterProfile,
     ShippingAutoRule,
+    SubUserInvoice,
     SubUserProfile,
     User,
 )
@@ -62,7 +64,7 @@ class PrintCenterProfileSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'email', 'full_name', 'company_name',
             'status', 'max_sub_users', 'sub_user_count',
-            'timezone', 'monthly_fee', 'logo_url',
+            'timezone', 'pending_timezone', 'monthly_fee', 'logo_url',
             'active_shop_count', 'awaiting_order_count', 'completed_order_count',
             'created_at',
             'ship_from_name', 'ship_from_phone',
@@ -73,6 +75,7 @@ class PrintCenterProfileSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             'id', 'email', 'full_name', 'status', 'sub_user_count',
+            'pending_timezone',
             'active_shop_count', 'awaiting_order_count', 'completed_order_count',
             'logo_url', 'created_at',
         )
@@ -171,6 +174,34 @@ class PrintCenterInvoiceSerializer(serializers.ModelSerializer):
         read_only_fields = ('id', 'print_center_name', 'created_at')
 
 
+class SubUserInvoiceSerializer(serializers.ModelSerializer):
+    sub_user_email = serializers.EmailField(source='sub_user.user.email', read_only=True)
+    sub_user_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SubUserInvoice
+        fields = (
+            'id', 'sub_user', 'sub_user_email', 'sub_user_name',
+            'period_year', 'period_month',
+            'order_count', 'item_count', 'item_charged',
+            'label_count', 'shipping_charged',
+            'extra_print_count', 'extra_print_charged',
+            'gross_charged', 'credits_total', 'amount',
+            'status', 'due_date', 'paid_at', 'note', 'created_at',
+        )
+        read_only_fields = (
+            'id', 'sub_user_email', 'sub_user_name', 'period_year', 'period_month',
+            'order_count', 'item_count', 'item_charged',
+            'label_count', 'shipping_charged',
+            'extra_print_count', 'extra_print_charged',
+            'gross_charged', 'credits_total', 'amount', 'due_date', 'created_at',
+        )
+
+    def get_sub_user_name(self, obj):
+        user = obj.sub_user.user
+        return user.full_name or user.email
+
+
 # ── Legacy register serializer (disabled at view level) ───────────────────────
 
 class RegisterPrintCenterSerializer(serializers.Serializer):
@@ -215,6 +246,8 @@ class SubUserCreateSerializer(serializers.Serializer):
     can_track_orders = serializers.BooleanField(default=True)
     can_view_financials = serializers.BooleanField(default=True)
     can_export_financials = serializers.BooleanField(default=True)
+    can_reship_without_pc_approval = serializers.BooleanField(default=False)
+    can_report_lost_shipment = serializers.BooleanField(default=False)
 
     # Balance settings
     negative_balance_limit = serializers.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -262,6 +295,8 @@ class SubUserCreateSerializer(serializers.Serializer):
             can_track_orders=validated_data['can_track_orders'],
             can_view_financials=validated_data['can_view_financials'],
             can_export_financials=validated_data['can_export_financials'],
+            can_reship_without_pc_approval=validated_data['can_reship_without_pc_approval'],
+            can_report_lost_shipment=validated_data['can_report_lost_shipment'],
         )
         return user
 
@@ -279,15 +314,17 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
             'id', 'user_id', 'email', 'full_name', 'is_active',
             'print_center_name', 'print_center_logo_url',
             'balance', 'negative_balance_limit',
+            'timezone', 'pending_timezone',
             'shipping_markup_type', 'shipping_markup_value',
             'extra_print_area_enabled', 'extra_print_area_price',
             'can_edit_orders', 'can_upload_product_mapping', 'can_upload_designs',
             'can_send_to_print', 'can_track_orders', 'can_view_financials', 'can_export_financials',
+            'can_reship_without_pc_approval', 'can_report_lost_shipment',
             'auto_product_matching', 'auto_design_matching', 'auto_shipping_rules',
             'created_at',
         )
         read_only_fields = ('id', 'user_id', 'email', 'balance', 'created_at',
-                            'print_center_name', 'print_center_logo_url')
+                            'print_center_name', 'print_center_logo_url', 'timezone')
 
     def get_print_center_logo_url(self, obj):
         if not obj.print_center.logo:
@@ -326,3 +363,10 @@ class ShippingAutoRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = ShippingAutoRule
         fields = ('id', 'marketplace_service', 'carrier_service')
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ('id', 'title', 'body', 'link', 'is_read', 'created_at')
+        read_only_fields = ('id', 'title', 'body', 'link', 'created_at')

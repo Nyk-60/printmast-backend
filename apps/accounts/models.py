@@ -77,6 +77,11 @@ class PrintCenterProfile(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
     max_sub_users = models.PositiveIntegerField(null=True, blank=True)  # null = unlimited
     timezone = models.CharField(max_length=64, default='UTC')
+    pending_timezone = models.CharField(
+        max_length=64, blank=True,
+        help_text='Requested timezone, applied by generate_monthly_invoices() on the 1st so past '
+                  'transactions never shift retroactively.',
+    )
     logo = models.ImageField(upload_to='print_center_logos/', null=True, blank=True)
     monthly_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
@@ -150,6 +155,42 @@ class PrintCenterInvoice(TimeStampedModel):
         return f"{self.print_center.company_name} {self.period_year}/{self.period_month:02d}"
 
 
+class SubUserInvoice(TimeStampedModel):
+    """Mirrors PrintCenterInvoice one level down: a sub-user's monthly bill from
+    their print center, generated from that month's BalanceTransaction activity."""
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        PAID = 'paid', 'Paid'
+        OVERDUE = 'overdue', 'Overdue'
+
+    sub_user = models.ForeignKey(
+        'SubUserProfile', on_delete=models.CASCADE, related_name='invoices'
+    )
+    period_year = models.PositiveIntegerField()
+    period_month = models.PositiveIntegerField()
+    order_count = models.PositiveIntegerField(default=0)
+    item_count = models.PositiveIntegerField(default=0)          # real unit quantity, see BalanceTransaction.quantity
+    item_charged = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    label_count = models.PositiveIntegerField(default=0)         # shipping-category lines, i.e. labels bought
+    shipping_charged = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    extra_print_count = models.PositiveIntegerField(default=0)
+    extra_print_charged = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    gross_charged = models.DecimalField(max_digits=10, decimal_places=2, default=0)  # = item + shipping + extra_print
+    credits_total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    due_date = models.DateField()
+    paid_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = ('sub_user', 'period_year', 'period_month')
+        ordering = ['-period_year', '-period_month']
+
+    def __str__(self):
+        return f"{self.sub_user.user.email} {self.period_year}/{self.period_month:02d}"
+
+
 class ImpersonationLog(TimeStampedModel):
     """Audit trail: which super admin accessed which print center account."""
     admin = models.ForeignKey(
@@ -174,6 +215,11 @@ class SubUserProfile(TimeStampedModel):
         User, on_delete=models.SET_NULL, null=True, related_name='created_sub_users'
     )
     is_active = models.BooleanField(default=True)
+
+    # Timezone — set by the print center (the sub-user only sees it, read-only).
+    # Changes are deferred the same way as PrintCenterProfile.pending_timezone.
+    timezone = models.CharField(max_length=64, default='UTC')
+    pending_timezone = models.CharField(max_length=64, blank=True)
 
     # Balance
     balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -200,6 +246,15 @@ class SubUserProfile(TimeStampedModel):
     can_track_orders = models.BooleanField(default=True)
     can_view_financials = models.BooleanField(default=True)
     can_export_financials = models.BooleanField(default=True)
+    can_reship_without_pc_approval = models.BooleanField(
+        default=False,
+        help_text='A print-center-fault reship from this sub-user skips PC approval and is '
+                  'processed immediately, like a self-fault reship.',
+    )
+    can_report_lost_shipment = models.BooleanField(
+        default=False,
+        help_text='Whether "Lost Shipment" appears as a reship reason for this sub-user.',
+    )
 
     # Auto-matching settings (toggled by the customer)
     auto_product_matching = models.BooleanField(default=True)
@@ -237,15 +292,32 @@ class BalanceTransaction(TimeStampedModel):
         REFUND = 'refund', 'Refund'
         ADJUSTMENT = 'adjustment', 'Adjustment'
 
+    class Category(models.TextChoices):
+        FULFILLMENT = 'fulfillment', 'Fulfillment'
+        SHIPPING = 'shipping', 'Shipping'
+        EXTRA_PRINT = 'extra_print', 'Additional Print'
+        MANUAL_ADJUSTMENT = 'manual_adjustment', 'Manual Adjustment'
+        INVOICE_PAYMENT = 'invoice_payment', 'Invoice Payment'
+
     sub_user = models.ForeignKey(
         SubUserProfile, on_delete=models.CASCADE, related_name='transactions'
     )
     type = models.CharField(max_length=20, choices=Type.choices)
+    category = models.CharField(max_length=20, choices=Category.choices, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     item_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipping_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    product_name = models.CharField(max_length=300, blank=True)
+    size = models.CharField(max_length=20, blank=True)
+    color = models.CharField(max_length=40, blank=True)
+    quantity = models.PositiveIntegerField(
+        default=1,
+        help_text='How many physical units this fulfillment line covers — the real basis '
+                  'for "item count" (SKU/line count is a different, less useful number).',
+    )
     description = models.TextField(blank=True)
     order_reference = models.CharField(max_length=128, blank=True)  # ShipStation order ID (display only)
+    order_number = models.CharField(max_length=64, blank=True)  # human-friendly order number (order.shipstation_order_number)
     order = models.ForeignKey(
         'orders.Order', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='balance_transactions',
@@ -256,5 +328,30 @@ class BalanceTransaction(TimeStampedModel):
         User, on_delete=models.SET_NULL, null=True, related_name='balance_transactions'
     )
 
+    @property
+    def display_id(self):
+        """Human-friendly 9-digit transaction number, derived from the PK (no separate counter needed)."""
+        return 100_000_000 + self.pk
+
     def __str__(self):
         return f"{self.get_type_display()} {self.amount} → {self.sub_user}"
+
+
+class Notification(TimeStampedModel):
+    """A simple in-app notification for one user — powers the top-bar bell.
+    Generic/reusable: any feature can create one, not just reship requests."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True)
+    link = models.CharField(
+        max_length=300, blank=True,
+        help_text='Frontend route path to open when clicked, e.g. "/reship-requests/42".',
+    )
+    is_read = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ('-created_at',)
+        indexes = [models.Index(fields=['user', 'is_read'])]
+
+    def __str__(self):
+        return f'{self.title} → {self.user.email}'

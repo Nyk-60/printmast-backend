@@ -12,6 +12,7 @@ api_v1 = [
     path('finance/', include('apps.payments.urls')),
     path('shipping/', include('apps.shipping.urls')),
     path('production/', include('apps.production.urls')),
+    path('reship/', include('apps.reship.urls')),
 ]
 
 urlpatterns = [
