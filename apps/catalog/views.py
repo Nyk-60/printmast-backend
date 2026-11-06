@@ -58,10 +58,6 @@ class CategoryViewSet(viewsets.ModelViewSet):
         if not (user.is_superadmin or user.is_print_center):
             raise PermissionDenied('Only superadmin or print center users can modify categories')
 
-    def _require_superadmin(self):
-        if not self.request.user.is_superadmin:
-            raise PermissionDenied('Only superadmin can perform this action')
-
     def create(self, request, *args, **kwargs):
         self._require_write_permission()
         return super().create(request, *args, **kwargs)
@@ -71,7 +67,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         return super().update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
-        self._require_superadmin()
+        self._require_write_permission()
         return super().destroy(request, *args, **kwargs)
 
 
@@ -163,6 +159,8 @@ class ProductViewSet(viewsets.ModelViewSet):
             primary_image=product.primary_image,
             variant1_label=product.variant1_label,
             variant2_label=product.variant2_label,
+            age=product.age,
+            subcategory=product.subcategory,
         )
 
         # Variants — new per-variant pricing format takes priority

@@ -58,8 +58,8 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
 class ProductListSerializer(serializers.ModelSerializer):
     brand          = serializers.CharField(source='brand.name')
-    category       = serializers.CharField(source='category.slug')
-    category_name  = serializers.CharField(source='category.name')
+    category       = serializers.CharField(source='category.slug', default=None)
+    category_name  = serializers.CharField(source='category.name', default=None)
     variant_count = serializers.IntegerField(source='variants.count', read_only=True)
     size_count    = serializers.SerializerMethodField()
     color_count   = serializers.SerializerMethodField()
@@ -68,7 +68,7 @@ class ProductListSerializer(serializers.ModelSerializer):
         model = Product
         fields = ('id', 'name', 'sku', 'brand', 'category', 'category_name', 'base_price', 'badge',
                   'primary_image', 'variant_count', 'size_count', 'color_count',
-                  'variant1_label', 'variant2_label')
+                  'variant1_label', 'variant2_label', 'age', 'subcategory')
 
     def get_size_count(self, obj):
         return len({v.size for v in obj.variants.all() if v.size})
@@ -89,7 +89,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
             'base_price', 'badge', 'is_active', 'primary_image',
-            'variant1_label', 'variant2_label',
+            'variant1_label', 'variant2_label', 'age', 'subcategory',
             'images', 'variants', 'print_areas',
         )
 
@@ -109,18 +109,27 @@ class ProductWriteSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
             'base_price', 'badge', 'is_active', 'primary_image',
-            'variant1_label', 'variant2_label',
+            'variant1_label', 'variant2_label', 'age', 'subcategory',
         )
 
 
 # ── Print center catalog ──────────────────────────────────────────────────────
 
 class PrintCenterPrintAreaSerializer(serializers.ModelSerializer):
+    # Read-only, for display (e.g. the sub-user catalog's print-area summary) —
+    # a follower (e.g. Right Sleeve) has no specs of its own, so this resolves
+    # through size_from to the owner's, matching how sizing actually works.
+    size_specs = serializers.SerializerMethodField()
+
     class Meta:
         model = PrintCenterPrintArea
         fields = ('id', 'name', 'is_default', 'is_active', 'width_inches', 'height_inches', 'icon',
-                  'size_mode', 'size_from')
+                  'size_mode', 'size_from', 'size_specs')
         extra_kwargs = {'size_mode': {'required': False}}
+
+    def get_size_specs(self, obj):
+        owner = obj.size_from or obj
+        return PrintAreaSizeSpecSerializer(owner.size_specs.all(), many=True).data
 
     def validate_size_from(self, target):
         if target is None:
@@ -197,7 +206,7 @@ class PrintCenterProductListSerializer(serializers.ModelSerializer):
         model = PrintCenterProduct
         fields = ('id', 'name', 'sku', 'brand', 'category', 'category_name', 'badge', 'is_active',
                   'primary_image', 'variant_count', 'min_price', 'size_count', 'color_count',
-                  'variant1_label', 'variant2_label')
+                  'variant1_label', 'variant2_label', 'age', 'subcategory', 'sort_order')
 
     def get_min_price(self, obj):
         agg = obj.variants.filter(is_active=True).aggregate(m=Min('cost'))
@@ -222,7 +231,7 @@ class PrintCenterProductDetailSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'name', 'sku', 'description', 'brand', 'category',
             'badge', 'is_active', 'primary_image', 'source_product_id',
-            'variant1_label', 'variant2_label',
+            'variant1_label', 'variant2_label', 'age', 'subcategory',
             'variants', 'print_areas',
         )
 
@@ -241,13 +250,15 @@ class PrintCenterProductWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = PrintCenterProduct
         fields = ('name', 'sku', 'description', 'brand', 'category', 'badge',
-                  'is_active', 'primary_image', 'variant1_label', 'variant2_label')
+                  'is_active', 'primary_image', 'variant1_label', 'variant2_label', 'age', 'subcategory', 'sort_order')
+        extra_kwargs = {'sort_order': {'required': False}}
 
     def create(self, validated_data):
-        return PrintCenterProduct.objects.create(
-            print_center=self.context['print_center'],
-            **validated_data,
-        )
+        pc = self.context['print_center']
+        if 'sort_order' not in validated_data:
+            last = PrintCenterProduct.objects.filter(print_center=pc).order_by('-sort_order').values_list('sort_order', flat=True).first()
+            validated_data['sort_order'] = (last or 0) + 1000
+        return PrintCenterProduct.objects.create(print_center=pc, **validated_data)
 
 
 class AdoptVariantOverrideSerializer(serializers.Serializer):

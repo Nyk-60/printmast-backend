@@ -45,7 +45,7 @@ BADGE_CHOICES = (
 # ── Platform Products (created by SuperAdmin) ─────────────────────────────────
 
 class Product(TimeStampedModel):
-    category = models.ForeignKey(Category, related_name='products', on_delete=models.PROTECT)
+    category = models.ForeignKey(Category, related_name='products', on_delete=models.SET_NULL, null=True, blank=True)
     brand = models.ForeignKey(Brand, related_name='products', on_delete=models.PROTECT)
     name = models.CharField(max_length=200)
     sku = models.CharField(max_length=64, blank=True, default='')
@@ -56,9 +56,22 @@ class Product(TimeStampedModel):
     primary_image = models.ImageField(upload_to='products/', blank=True, null=True)
     variant1_label = models.CharField(max_length=40, default='Size')
     variant2_label = models.CharField(max_length=40, default='Color')
+    age = models.CharField(
+        max_length=40, blank=True, default='',
+        help_text='Free text, e.g. Adult, Youth, Kids — the catalog Age filter lists whatever values are in use.',
+    )
+    subcategory = models.CharField(
+        max_length=60, blank=True, default='',
+        help_text='Free text, e.g. T-Shirts, Sweatshirts — the catalog Subcategory filter lists whatever values are in use.',
+    )
 
     class Meta:
         ordering = ('-created_at',)
+
+    def save(self, *args, **kwargs):
+        from apps.core.images import optimize_field
+        optimize_field(self.primary_image)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.name} ({self.sku})'
@@ -71,6 +84,11 @@ class ProductImage(TimeStampedModel):
 
     class Meta:
         ordering = ('sort_order',)
+
+    def save(self, *args, **kwargs):
+        from apps.core.images import optimize_field
+        optimize_field(self.image)
+        super().save(*args, **kwargs)
 
 
 class ProductVariant(TimeStampedModel):
@@ -130,16 +148,30 @@ class PrintCenterProduct(TimeStampedModel):
     name = models.CharField(max_length=200)
     sku = models.CharField(max_length=64, blank=True, default='')
     description = models.TextField(blank=True)
-    category = models.ForeignKey(Category, related_name='pc_products', on_delete=models.PROTECT, null=True, blank=True)
+    category = models.ForeignKey(Category, related_name='pc_products', on_delete=models.SET_NULL, null=True, blank=True)
     brand = models.ForeignKey(Brand, related_name='pc_products', on_delete=models.PROTECT, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     primary_image = models.ImageField(upload_to='pc_products/', blank=True, null=True)
     badge = models.CharField(max_length=16, choices=BADGE_CHOICES, blank=True)
     variant1_label = models.CharField(max_length=40, default='Size')
     variant2_label = models.CharField(max_length=40, default='Color')
+    age = models.CharField(
+        max_length=40, blank=True, default='',
+        help_text='Free text, e.g. Adult, Youth, Kids — the catalog Age filter lists whatever values are in use.',
+    )
+    subcategory = models.CharField(
+        max_length=60, blank=True, default='',
+        help_text='Free text, e.g. T-Shirts, Sweatshirts — the catalog Subcategory filter lists whatever values are in use.',
+    )
+    sort_order = models.FloatField(default=0, help_text='Manual display order (drag-and-drop in My Catalog). Lower sorts first.')
 
     class Meta:
-        ordering = ('-created_at',)
+        ordering = ('sort_order', '-created_at')
+
+    def save(self, *args, **kwargs):
+        from apps.core.images import optimize_field
+        optimize_field(self.primary_image)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.name} [{self.print_center.company_name}]'
@@ -244,6 +276,11 @@ class PrintCenterPrintArea(models.Model):
 
     class Meta:
         unique_together = ('pc_product', 'name')
+
+    def save(self, *args, **kwargs):
+        from apps.core.images import optimize_field
+        optimize_field(self.icon)
+        super().save(*args, **kwargs)
 
     @property
     def sizing_area(self):
