@@ -1,6 +1,14 @@
 from rest_framework import serializers
 
-from .models import Order, OrderEvent, OrderItem, ProductMapping
+from apps.accounts.scoping import get_sub_user_scope
+
+from .models import Order, OrderEvent, OrderItem, OrderTag, ProductMapping
+
+
+class OrderTagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderTag
+        fields = ('id', 'name', 'color')
 
 
 def _get_reship_info(obj):
@@ -62,7 +70,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'shipstation_item_id', 'marketplace_sku',
             'raw_product_name', 'raw_options', 'personalization',
-            'quantity', 'unit_price', 'image_url', 'display_image_url',
+            'quantity', 'unit_price', 'image_url', 'display_image_url', 'is_manual',
             'pc_variant', 'pc_variant_sku', 'pc_variant_display', 'matched_at',
             'is_matched', 'pc_product_name', 'pc_variant_size', 'pc_variant_color',
             'pc_variant1_label', 'pc_variant2_label', 'pc_variant_weight_oz',
@@ -87,6 +95,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderItemPreviewSerializer(serializers.ModelSerializer):
     is_matched           = serializers.SerializerMethodField()
+    pc_product_id         = serializers.IntegerField(source='pc_variant.pc_product_id', read_only=True, default=None)
+    pc_variant_id         = serializers.IntegerField(read_only=True, default=None)
     pc_product_name      = serializers.CharField(source='pc_variant.pc_product.name', read_only=True, default=None)
     pc_variant_size      = serializers.CharField(source='pc_variant.size', read_only=True, default=None)
     pc_variant_color     = serializers.CharField(source='pc_variant.color', read_only=True, default=None)
@@ -103,8 +113,8 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
         model = OrderItem
         fields = (
             'id', 'image_url', 'display_image_url', 'raw_product_name', 'marketplace_sku',
-            'raw_options', 'personalization', 'quantity', 'unit_price',
-            'is_matched', 'pc_product_name', 'pc_variant_size', 'pc_variant_color',
+            'raw_options', 'personalization', 'quantity', 'unit_price', 'is_manual',
+            'is_matched', 'pc_product_id', 'pc_variant_id', 'pc_product_name', 'pc_variant_size', 'pc_variant_color',
             'pc_variant1_label', 'pc_variant2_label', 'pc_variant_weight_oz', 'pc_variant_is_dark',
             'designs', 'available_print_areas', 'pc_product_colors',
         )
@@ -124,7 +134,7 @@ class OrderItemPreviewSerializer(serializers.ModelSerializer):
         from apps.designs.models import SkuDesign
 
         request = self.context.get('request')
-        sub_user = getattr(request.user, 'sub_user_profile', None) if request else None
+        sub_user, _ = get_sub_user_scope(request.user) if request else (None, None)
         if not sub_user:
             # A read-only viewer (the print center) doesn't get the sub-user's editable
             # design library — just the design(s) actually attached to this order item,
@@ -243,6 +253,7 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
     item_cost             = serializers.SerializerMethodField()
     extra_print_area_fee  = serializers.SerializerMethodField()
     reship_info           = serializers.SerializerMethodField()
+    tag                   = OrderTagSerializer(read_only=True)
 
     class Meta:
         model = Order
@@ -257,8 +268,8 @@ class OrderListSerializer(OrderCostMixin, serializers.ModelSerializer):
             'requested_service', 'shipping_cost', 'status',
             'selected_carrier_code', 'selected_service_code', 'selected_service_name',
             'shipping_category_override', 'shipping_category',
-            'buyer_note', 'gift_message', 'is_gift', 'internal_note',
-            'tracking_number', 'label_url',
+            'buyer_note', 'gift_message', 'is_gift', 'internal_note', 'shipstation_sync_error',
+            'tracking_number', 'label_url', 'label_source', 'tag',
             'shipping_override', 'shipping_dims_auto', 'default_shipping_option',
             'unmatched_count', 'has_design', 'items',
             'item_cost', 'extra_print_area_fee', 'reship_info',
@@ -363,6 +374,7 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
     item_cost            = serializers.SerializerMethodField()
     extra_print_area_fee = serializers.SerializerMethodField()
     reship_info          = serializers.SerializerMethodField()
+    tag                  = OrderTagSerializer(read_only=True)
 
     class Meta:
         model = Order
@@ -376,8 +388,8 @@ class OrderDetailSerializer(OrderCostMixin, serializers.ModelSerializer):
             'address_verified', 'address_status', 'ship_by_date', 'ordered_at',
             'requested_service', 'selected_carrier_code', 'selected_service_code',
             'shipping_category_override', 'shipping_category',
-            'shipping_cost', 'tracking_number', 'label_url',
-            'buyer_note', 'print_note', 'status', 'reship_info',
+            'shipping_cost', 'tracking_number', 'label_url', 'label_source', 'tag',
+            'buyer_note', 'print_note', 'status', 'reship_info', 'shipstation_sync_error',
             'shipping_override', 'shipping_dims_auto',
             'items', 'item_cost', 'extra_print_area_fee',
         )

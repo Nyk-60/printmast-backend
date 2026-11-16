@@ -15,6 +15,7 @@ from .models import (
     ShippingAutoRule,
     SubUserInvoice,
     SubUserProfile,
+    TeamMemberProfile,
     User,
 )
 
@@ -241,11 +242,6 @@ class SubUserCreateSerializer(serializers.Serializer):
     # Permissions
     can_edit_orders = serializers.BooleanField(default=True)
     can_upload_product_mapping = serializers.BooleanField(default=True)
-    can_upload_designs = serializers.BooleanField(default=True)
-    can_send_to_print = serializers.BooleanField(default=True)
-    can_track_orders = serializers.BooleanField(default=True)
-    can_view_financials = serializers.BooleanField(default=True)
-    can_export_financials = serializers.BooleanField(default=True)
     can_reship_without_pc_approval = serializers.BooleanField(default=False)
     can_report_lost_shipment = serializers.BooleanField(default=False)
 
@@ -290,11 +286,6 @@ class SubUserCreateSerializer(serializers.Serializer):
             extra_print_area_price=validated_data['extra_print_area_price'],
             can_edit_orders=validated_data['can_edit_orders'],
             can_upload_product_mapping=validated_data['can_upload_product_mapping'],
-            can_upload_designs=validated_data['can_upload_designs'],
-            can_send_to_print=validated_data['can_send_to_print'],
-            can_track_orders=validated_data['can_track_orders'],
-            can_view_financials=validated_data['can_view_financials'],
-            can_export_financials=validated_data['can_export_financials'],
             can_reship_without_pc_approval=validated_data['can_reship_without_pc_approval'],
             can_report_lost_shipment=validated_data['can_report_lost_shipment'],
         )
@@ -308,6 +299,14 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
     print_center_name = serializers.CharField(source='print_center.company_name', read_only=True)
     print_center_logo_url = serializers.SerializerMethodField()
 
+    # Annotated on the list queryset (SubUserListCreateView.get) via correlated
+    # subqueries; absent (plain detail/edit fetch) falls back to None so this
+    # serializer stays usable both ways.
+    total_orders = serializers.SerializerMethodField()
+    total_items = serializers.SerializerMethodField()
+    processed_total = serializers.SerializerMethodField()
+    team_member_count = serializers.SerializerMethodField()
+
     class Meta:
         model = SubUserProfile
         fields = (
@@ -317,10 +316,10 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
             'timezone', 'pending_timezone',
             'shipping_markup_type', 'shipping_markup_value',
             'extra_print_area_enabled', 'extra_print_area_price',
-            'can_edit_orders', 'can_upload_product_mapping', 'can_upload_designs',
-            'can_send_to_print', 'can_track_orders', 'can_view_financials', 'can_export_financials',
+            'can_edit_orders', 'can_upload_product_mapping',
             'can_reship_without_pc_approval', 'can_report_lost_shipment',
             'auto_product_matching', 'auto_design_matching', 'auto_shipping_rules',
+            'total_orders', 'total_items', 'processed_total', 'team_member_count',
             'created_at',
         )
         read_only_fields = ('id', 'user_id', 'email', 'balance', 'created_at',
@@ -334,12 +333,78 @@ class SubUserProfileSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(obj.print_center.logo.url)
         return obj.print_center.logo.url
 
+    def get_total_orders(self, obj):
+        return getattr(obj, 'total_orders', None)
+
+    def get_total_items(self, obj):
+        return getattr(obj, 'total_items', None)
+
+    def get_processed_total(self, obj):
+        return getattr(obj, 'processed_total', None)
+
+    def get_team_member_count(self, obj):
+        return getattr(obj, 'team_member_count', None)
+
     def update(self, instance, validated_data):
         user_data = validated_data.pop('user', {})
         if 'full_name' in user_data:
             instance.user.full_name = user_data['full_name']
             instance.user.save(update_fields=['full_name'])
         return super().update(instance, validated_data)
+
+
+# ── Team Member ────────────────────────────────────────────────────────────────
+
+class TeamMemberCreateSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, min_length=8)
+    full_name = serializers.CharField(max_length=120, required=False, allow_blank=True, default='')
+    store_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
+
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError('Email already registered')
+        return value
+
+    def validate_store_ids(self, value):
+        sub_user = self.context['sub_user']
+        allowed = set(sub_user.assigned_stores.values_list('id', flat=True))
+        if not set(value) <= allowed:
+            raise serializers.ValidationError('One or more stores are not assigned to your account.')
+        return value
+
+    @transaction.atomic
+    def create(self, validated_data):
+        sub_user = self.context['sub_user']
+        user = User.objects.create_user(
+            email=validated_data['email'],
+            password=validated_data['password'],
+            full_name=validated_data.get('full_name', ''),
+            role=User.Role.TEAM_MEMBER,
+        )
+        team_member = TeamMemberProfile.objects.create(
+            user=user,
+            sub_user=sub_user,
+            created_by=self.context['request'].user,
+        )
+        if validated_data.get('store_ids'):
+            team_member.assigned_stores.set(validated_data['store_ids'])
+        return team_member
+
+
+class TeamMemberSerializer(serializers.ModelSerializer):
+    email = serializers.EmailField(source='user.email', read_only=True)
+    full_name = serializers.CharField(source='user.full_name', read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    store_ids = serializers.PrimaryKeyRelatedField(
+        source='assigned_stores', many=True, read_only=True
+    )
+    store_count = serializers.IntegerField(source='assigned_stores.count', read_only=True)
+
+    class Meta:
+        model = TeamMemberProfile
+        fields = ('id', 'user_id', 'email', 'full_name', 'is_active', 'store_ids', 'store_count', 'created_at')
+        read_only_fields = fields
 
 
 class AddBalanceSerializer(serializers.Serializer):

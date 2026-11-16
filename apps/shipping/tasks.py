@@ -357,6 +357,137 @@ def push_personalization_to_shipstation(self, order_id, item_id):
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def resync_order_to_shipstation(self, order_id):
+    """Full resync — see apps/shipping/client.py::resync_order. Used to recover
+    an order whose shipstation_sync_error is set, regardless of which earlier
+    edit actually failed."""
+    from apps.orders.models import Order
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+    except Order.DoesNotExist:
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        client.resync_order(order)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_quantity_to_shipstation(self, order_id, item_id):
+    """Push a platform-side quantity edit back to ShipStation."""
+    from apps.orders.models import Order, OrderItem
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+        item  = order.items.get(pk=item_id)
+    except (Order.DoesNotExist, OrderItem.DoesNotExist):
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        client.update_item_quantity(order, item)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_sku_to_shipstation(self, order_id, item_id):
+    """Push a platform-side SKU edit back to ShipStation."""
+    from apps.orders.models import Order, OrderItem
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+        item  = order.items.get(pk=item_id)
+    except (Order.DoesNotExist, OrderItem.DoesNotExist):
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        client.update_item_sku(order, item)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_item_removal_to_shipstation(self, order_id, shipstation_item_id):
+    """Push a platform-side item deletion back to ShipStation. Takes the
+    ShipStation orderItemId directly (not our pk) since the OrderItem row is
+    already gone by the time this runs."""
+    from apps.orders.models import Order
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+    except Order.DoesNotExist:
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        client.remove_item_by_id(order, shipstation_item_id)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_new_item_to_shipstation(self, order_id, item_id):
+    """Push a staff-added/cloned item to ShipStation and capture the
+    orderItemId it assigns back onto our OrderItem row."""
+    from apps.orders.models import Order, OrderItem
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+        item  = order.items.get(pk=item_id)
+    except (Order.DoesNotExist, OrderItem.DoesNotExist):
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        result = client.add_item_to_order(order, item)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+    ss_items = result.get('items') if isinstance(result, dict) else None
+    if ss_items:
+        match = next(
+            (
+                si for si in ss_items
+                if (si.get('sku') or '') == (item.marketplace_sku or '')
+                and (si.get('name') or '') == (item.raw_product_name or '')
+                and si.get('quantity') == item.quantity
+                and si.get('orderItemId')
+            ),
+            None,
+        )
+        if match:
+            OrderItem.objects.filter(pk=item.pk).update(shipstation_item_id=str(match['orderItemId']))
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def push_notes_to_shipstation(self, order_id):
+    """Push a platform-side buyer/internal note or gift edit back to ShipStation."""
+    from apps.orders.models import Order
+    from .client import ShipStationClient, ShipStationError
+
+    try:
+        order = Order.objects.select_related('store__shipstation_account').prefetch_related('items').get(pk=order_id)
+    except Order.DoesNotExist:
+        return
+
+    client = ShipStationClient(order.store.shipstation_account)
+    try:
+        client.update_order_notes(order)
+    except ShipStationError as exc:
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
 def push_address_to_shipstation(self, order_id):
     """Push a platform-side address edit back to ShipStation."""
     from apps.orders.models import Order

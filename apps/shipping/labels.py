@@ -35,13 +35,21 @@ def _first_page_image(raw, dpi):
     return Image.open(io.BytesIO(raw)).convert('RGB')
 
 
-def label_to_png(raw, dpi=LABEL_DPI, pad_px=12):
-    """Any label file (PDF or image) -> PNG bytes, tightly cropped, landscape.
+def label_to_png(raw, dpi=LABEL_DPI, pad_px=12, orientation='landscape'):
+    """Any label file (PDF or image) -> PNG bytes, tightly cropped.
 
-    Labels usually sit on a mostly empty page, so the whitespace is cropped away.
-    Portrait labels (the usual 4x6) are turned to landscape so they fill the slip's
-    width; the label is stuck on a parcel as a whole, so its orientation on the slip
-    does not matter.
+    Labels usually sit on a mostly empty page, so the whitespace is cropped away
+    first — what's left is the label's own printed content box, which can come out
+    wider-than-tall or taller-than-wide regardless of the source page's orientation
+    (e.g. a label block laid out sideways on an otherwise-portrait PDF page).
+
+    orientation picks what to do with that cropped box:
+    - 'landscape' (default, used for the production slip): rotate it to fill the
+      slip's width — the label is stuck on a parcel as a whole, its orientation on
+      the slip doesn't matter.
+    - 'portrait' (used for the narrow order-card preview): rotate the other way,
+      so it reads top-to-bottom in a tall, narrow space.
+    - None: leave exactly as cropped.
     """
     img = _first_page_image(raw, dpi)
 
@@ -52,7 +60,9 @@ def label_to_png(raw, dpi=LABEL_DPI, pad_px=12):
             max(0, left - pad_px), max(0, top - pad_px),
             min(img.width, right + pad_px), min(img.height, bottom + pad_px),
         ))
-    if img.height > img.width:
+    if orientation == 'landscape' and img.height > img.width:
+        img = img.rotate(90, expand=True)
+    elif orientation == 'portrait' and img.width > img.height:
         img = img.rotate(90, expand=True)
 
     # Most labels are pure black-and-white: store them as grayscale (a fraction of
@@ -65,13 +75,13 @@ def label_to_png(raw, dpi=LABEL_DPI, pad_px=12):
     return out.getvalue()
 
 
-def load_label_png(order):
+def load_label_png(order, orientation='landscape'):
     """Label picture for an order from its stored file, or None if unavailable."""
     if not getattr(order, 'label_file', None):
         return None
     try:
         with order.label_file.open('rb') as fh:
-            return label_to_png(fh.read())
+            return label_to_png(fh.read(), orientation=orientation)
     except Exception:
         logger.exception('Could not load label file for order %s', order.pk)
         return None

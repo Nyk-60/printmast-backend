@@ -13,6 +13,7 @@ api_v1 = [
     path('shipping/', include('apps.shipping.urls')),
     path('production/', include('apps.production.urls')),
     path('reship/', include('apps.reship.urls')),
+    path('core/', include('apps.core.urls')),
 ]
 
 urlpatterns = [

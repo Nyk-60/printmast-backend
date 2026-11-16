@@ -1,6 +1,7 @@
 from rest_framework.permissions import BasePermission
 
 from .models import PrintCenterProfile
+from .scoping import get_sub_user_scope
 
 
 class IsSuperAdmin(BasePermission):
@@ -30,6 +31,17 @@ class IsSubUser(BasePermission):
             return request.user.sub_user_profile.is_active
         except Exception:
             return False
+
+
+class IsSubUserOrTeamMember(BasePermission):
+    """Like IsSubUser, but also admits an active Team Member — for every
+    view a Team Member should share with the sub-user whose data they're
+    scoped to (see apps.accounts.scoping.get_sub_user_scope)."""
+    def has_permission(self, request, view):
+        if not (request.user and request.user.is_authenticated):
+            return False
+        sub_user, _ = get_sub_user_scope(request.user)
+        return sub_user is not None
 
 
 class IsPrintCenterOrSuperAdmin(BasePermission):

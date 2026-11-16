@@ -3,6 +3,26 @@ from django.db import models
 from apps.core.models import TimeStampedModel
 
 
+class OrderTag(TimeStampedModel):
+    """A sub-user-defined label (e.g. "Waiting on customer") a sub-user or
+    team member can apply to an order to track it — platform-only, never
+    pushed to ShipStation. Only the owning sub-user (not a team member)
+    creates/edits/deletes the tag definitions; both can apply/remove them
+    on an order — see OrderViewSet.set_tag."""
+    sub_user = models.ForeignKey(
+        'accounts.SubUserProfile', related_name='order_tags', on_delete=models.CASCADE
+    )
+    name = models.CharField(max_length=40)
+    color = models.CharField(max_length=7, default='#6b7280')  # hex, e.g. "#f59e0b"
+
+    class Meta:
+        ordering = ('name',)
+        unique_together = ('sub_user', 'name')
+
+    def __str__(self):
+        return self.name
+
+
 class Order(TimeStampedModel):
     class Status(models.TextChoices):
         NEW = 'new', 'New'
@@ -90,10 +110,27 @@ class Order(TimeStampedModel):
     label_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     labeled_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
+    class LabelSource(models.TextChoices):
+        PURCHASED = 'purchased', 'Purchased'
+        UPLOADED = 'uploaded', 'Uploaded by seller'
+
+    # Set to UPLOADED when the seller already bought a label elsewhere and
+    # attached it themselves — purchase_label_for_order() then skips buying
+    # one (see its labeled_at check) and the batch label pass treats it as
+    # already labeled with no provider call.
+    label_source = models.CharField(
+        max_length=10, choices=LabelSource.choices, default=LabelSource.PURCHASED,
+    )
+
     # Shipping override (PC-only: overrides auto-calculated weight/dims before ShipStation push)
     shipping_override = models.JSONField(
         null=True, blank=True,
         help_text='PC-set override: {weight_oz, length, width, height, note}. Null = use auto-calc.',
+    )
+
+    # Tracking tag (e.g. "Waiting on customer") — platform-only, see OrderTag.
+    tag = models.ForeignKey(
+        OrderTag, null=True, blank=True, on_delete=models.SET_NULL, related_name='orders'
     )
 
     # Notes
@@ -114,6 +151,11 @@ class Order(TimeStampedModel):
         default=False,
         help_text='A PC-fault reship order — send_to_print charges $0 for it instead of the '
                   'normal cost. See apps/reship/services.py.',
+    )
+    shipstation_sync_error = models.TextField(
+        blank=True, default='',
+        help_text='Set when the most recent push of a platform edit (personalization/qty/sku/'
+                  'notes/items) to ShipStation failed; cleared on the next successful push.',
     )
 
     class Meta:
@@ -137,6 +179,10 @@ class OrderItem(TimeStampedModel):
     custom_image = models.ImageField(upload_to='order_item_images/', blank=True, null=True)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    is_manual = models.BooleanField(
+        default=False,
+        help_text='Added from the panel (clone/add-item), not sourced from the marketplace order.',
+    )
 
     # Filled after product matching
     pc_variant = models.ForeignKey(
@@ -168,6 +214,7 @@ class OrderEvent(TimeStampedModel):
         MATCHED = 'matched', 'Product Matched'
         DESIGN_UPLOADED = 'design_uploaded', 'Design Uploaded'
         DESIGN_REMOVED = 'design_removed', 'Design Removed'
+        LABEL_REMOVED = 'label_removed', 'Shipping Label Removed'
         READY = 'ready', 'Ready for Print'
         SENT_TO_PRINT = 'sent_to_print', 'Sent to Print'
         RECALLED = 'recalled', 'Recalled to New Orders'

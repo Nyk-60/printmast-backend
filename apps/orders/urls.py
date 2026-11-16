@@ -8,6 +8,8 @@ from .views import (
     MappingGenerateTemplateView,
     MappingTemplateView,
     MappingUploadView,
+    OrderTagDetailView,
+    OrderTagListCreateView,
     ProductionQueueView,
     ProductMappingDeleteView,
     ProductMappingListView,
@@ -27,4 +29,6 @@ urlpatterns = [
     path('mappings/export/', MappingExportView.as_view(), name='mapping-export'),
     path('mappings/upload/', MappingUploadView.as_view(), name='mapping-upload'),
     path('production-queue/', ProductionQueueView.as_view(), name='production-queue'),
+    path('tags/', OrderTagListCreateView.as_view(), name='order-tag-list'),
+    path('tags/<int:pk>/', OrderTagDetailView.as_view(), name='order-tag-detail'),
 ] + router.urls

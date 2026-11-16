@@ -7,6 +7,7 @@ from .views import (
     MyCatalogProductView,
     MyCatalogView,
     PrintAreaDimsView,
+    PcCatalogQuoteExportView,
     SubCatalogColorClassificationView,
     SubCatalogExportView,
     PlatformVariantDetailView,
@@ -50,6 +51,7 @@ urlpatterns = [
     path('my-catalog/<int:pk>/print-areas/', PrintCenterPrintAreaCreateView.as_view(), name='pc-area-create'),
     path('my-catalog/<int:pk>/print-areas/<int:area_pk>/', PrintCenterPrintAreaView.as_view(), name='pc-area-detail'),
     path('my-catalog/<int:pk>/print-area-dims/', PrintAreaDimsView.as_view(), name='pc-area-dims'),
+    path('my-catalog/quote-export/', PcCatalogQuoteExportView.as_view(), name='pc-catalog-quote-export'),
 
     # Sub-user: read-only view of their print center's catalog
     path('sub-catalog/', MyCatalogView.as_view(), name='sub-catalog-list'),

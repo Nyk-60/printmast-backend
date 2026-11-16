@@ -2,9 +2,10 @@ import io
 
 import pytz
 from django.db import transaction
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone as tz
-from rest_framework import generics, status
+from rest_framework import generics, serializers, status
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -20,9 +21,11 @@ from .models import (
     PrintCenterPricingTier,
     PrintCenterProfile,
     SubUserProfile,
+    TeamMemberProfile,
     User,
 )
-from .permissions import IsPrintCenter, IsSuperAdmin
+from .permissions import IsPrintCenter, IsSubUser, IsSuperAdmin
+from .scoping import get_sub_user_scope
 from .serializers import (
     AddBalanceSerializer,
     BalanceTransactionSerializer,
@@ -36,6 +39,8 @@ from .serializers import (
     ShippingAutoRuleSerializer,
     SubUserCreateSerializer,
     SubUserProfileSerializer,
+    TeamMemberCreateSerializer,
+    TeamMemberSerializer,
     UpdatePrintCenterSerializer,
     UserSerializer,
 )
@@ -88,6 +93,24 @@ class MeView(APIView):
                 ).data
             except SubUserProfile.DoesNotExist:
                 pass
+        elif request.user.is_team_member:
+            try:
+                team_member = request.user.team_member_profile
+                # Same panel as the parent sub-user (settings, balance display,
+                # permission flags all read from here) — the restriction to
+                # assigned stores is applied server-side wherever data is
+                # store-scoped, not surfaced as a different "profile" shape.
+                data['profile'] = SubUserProfileSerializer(
+                    team_member.sub_user, context={'request': request},
+                ).data
+                # A Team Member never sees account balance/debt, only the real
+                # sub-user does — strip it even though it's served from the
+                # parent's own profile.
+                data['profile'].pop('balance', None)
+                data['profile'].pop('negative_balance_limit', None)
+                data['team_member'] = TeamMemberSerializer(team_member).data
+            except TeamMemberProfile.DoesNotExist:
+                pass
         return Response(data)
 
     def patch(self, request):
@@ -99,9 +122,9 @@ class MeView(APIView):
             user.set_password(request.data['password'])
             user.save(update_fields=['password'])
 
-        if user.is_sub_user:
+        if user.is_sub_user or user.is_team_member:
             PROFILE_BOOL_FIELDS = ('auto_product_matching', 'auto_design_matching', 'auto_shipping_rules')
-            profile = user.sub_user_profile
+            profile, _ = get_sub_user_scope(user)
             update_fields = []
             for field in PROFILE_BOOL_FIELDS:
                 if field in request.data:
@@ -572,9 +595,38 @@ class SubUserListCreateView(APIView):
     permission_classes = (IsPrintCenter,)
 
     def get(self, request):
+        # Each stat below is its own correlated subquery (not a combined
+        # .annotate() over both `transactions` and `team_members`) — annotating
+        # two separate reverse relations in one query fans out into a cross
+        # join and silently inflates the Sum/Count results.
+        debit_qs = BalanceTransaction.objects.filter(sub_user=OuterRef('pk'), type=BalanceTransaction.Type.DEBIT)
+        total_orders_sq = (
+            debit_qs.values('sub_user').annotate(c=Count('order', distinct=True)).values('c')
+        )
+        total_items_sq = (
+            debit_qs.filter(category=BalanceTransaction.Category.FULFILLMENT)
+            .values('sub_user').annotate(s=Sum('quantity')).values('s')
+        )
+        processed_total_sq = (
+            debit_qs.values('sub_user').annotate(s=Sum('amount')).values('s')
+        )
+        team_member_sq = (
+            TeamMemberProfile.objects.filter(sub_user=OuterRef('pk'), is_active=True)
+            .values('sub_user').annotate(c=Count('id')).values('c')
+        )
+
         qs = SubUserProfile.objects.filter(
             print_center=request.user.print_center_profile
-        ).select_related('user').order_by('-created_at')
+        ).select_related('user').annotate(
+            total_orders=Coalesce(Subquery(total_orders_sq, output_field=IntegerField()), 0),
+            total_items=Coalesce(Subquery(total_items_sq, output_field=IntegerField()), 0),
+            processed_total=Coalesce(
+                Subquery(processed_total_sq, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                0,
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            ),
+            team_member_count=Coalesce(Subquery(team_member_sq, output_field=IntegerField()), 0),
+        ).order_by('-created_at')
         return Response(SubUserProfileSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -629,6 +681,79 @@ class SubUserToggleActiveView(APIView):
         return Response({'is_active': profile.is_active})
 
 
+class TeamMemberListCreateView(APIView):
+    """A sub-user's own team members — not the Team Member's own view, only
+    the parent sub-user manages their team (see IsSubUser, not
+    IsSubUserOrTeamMember)."""
+    permission_classes = (IsSubUser,)
+
+    def get(self, request):
+        qs = TeamMemberProfile.objects.filter(
+            sub_user=request.user.sub_user_profile
+        ).select_related('user').prefetch_related('assigned_stores').order_by('-created_at')
+        return Response(TeamMemberSerializer(qs, many=True).data)
+
+    def post(self, request):
+        serializer = TeamMemberCreateSerializer(
+            data=request.data,
+            context={'request': request, 'sub_user': request.user.sub_user_profile},
+        )
+        serializer.is_valid(raise_exception=True)
+        team_member = serializer.save()
+        return Response(TeamMemberSerializer(team_member).data, status=status.HTTP_201_CREATED)
+
+
+class TeamMemberDetailView(APIView):
+    permission_classes = (IsSubUser,)
+
+    def _get_object(self, request, pk):
+        try:
+            return TeamMemberProfile.objects.select_related('user').get(
+                pk=pk, sub_user=request.user.sub_user_profile
+            )
+        except TeamMemberProfile.DoesNotExist:
+            raise NotFound()
+
+    def patch(self, request, pk):
+        team_member = self._get_object(request, pk)
+        data = request.data
+
+        if 'email' in data:
+            if User.objects.filter(email=data['email']).exclude(pk=team_member.user_id).exists():
+                raise serializers.ValidationError({'email': 'Email already registered'})
+            team_member.user.email = data['email']
+            team_member.user.save(update_fields=['email'])
+        if 'full_name' in data:
+            team_member.user.full_name = data['full_name']
+            team_member.user.save(update_fields=['full_name'])
+        if 'password' in data:
+            team_member.user.set_password(data['password'])
+            team_member.user.save(update_fields=['password'])
+        if 'is_active' in data:
+            team_member.is_active = bool(data['is_active'])
+            team_member.user.is_active = team_member.is_active
+            team_member.save(update_fields=['is_active'])
+            team_member.user.save(update_fields=['is_active'])
+
+        return Response(TeamMemberSerializer(self._get_object(request, pk)).data)
+
+
+class TeamMemberStoresView(APIView):
+    permission_classes = (IsSubUser,)
+
+    def patch(self, request, pk):
+        try:
+            team_member = TeamMemberProfile.objects.get(pk=pk, sub_user=request.user.sub_user_profile)
+        except TeamMemberProfile.DoesNotExist:
+            raise NotFound()
+        store_ids = request.data.get('store_ids', [])
+        allowed = set(request.user.sub_user_profile.assigned_stores.values_list('id', flat=True))
+        if not set(store_ids) <= allowed:
+            raise serializers.ValidationError({'store_ids': 'One or more stores are not assigned to your account.'})
+        team_member.assigned_stores.set(store_ids)
+        return Response(TeamMemberSerializer(team_member).data)
+
+
 class AddBalanceView(APIView):
     permission_classes = (IsPrintCenter,)
 
@@ -678,22 +803,23 @@ class MyTransactionsView(generics.ListAPIView):
     serializer_class = BalanceTransactionSerializer
 
     def get_queryset(self):
-        return BalanceTransaction.objects.filter(
-            sub_user=self.request.user.sub_user_profile
-        ).order_by('-created_at')
+        sub_user, _ = get_sub_user_scope(self.request.user)
+        return BalanceTransaction.objects.filter(sub_user=sub_user).order_by('-created_at')
 
 
 class MyShippingRulesView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        rules = request.user.sub_user_profile.shipping_rules.all()
+        sub_user, _ = get_sub_user_scope(request.user)
+        rules = sub_user.shipping_rules.all()
         return Response(ShippingAutoRuleSerializer(rules, many=True).data)
 
     def post(self, request):
+        sub_user, _ = get_sub_user_scope(request.user)
         serializer = ShippingAutoRuleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        serializer.save(sub_user=request.user.sub_user_profile)
+        serializer.save(sub_user=sub_user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -701,8 +827,9 @@ class MyShippingRuleDeleteView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def delete(self, request, rule_id):
+        sub_user, _ = get_sub_user_scope(request.user)
         try:
-            rule = request.user.sub_user_profile.shipping_rules.get(pk=rule_id)
+            rule = sub_user.shipping_rules.get(pk=rule_id)
         except Exception:
             raise NotFound()
         rule.delete()

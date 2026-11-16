@@ -437,14 +437,15 @@ def parse_mapping_excel(file_obj, sub_user, store=None):
     return created_count, updated_count, skipped, errors
 
 
-def generate_mapping_template(sub_user):
+def generate_mapping_template(sub_user, store_ids=None):
     """
     Build an Excel template pre-filled from unmatched order items.
 
     D-G columns are pre-filled with the exact raw_options values from actual
     unmatched orders so the user cannot accidentally mistype them. A-C columns
     are left empty (or pre-filled from an existing mapping if one exists).
-    De-duplicated by marketplace_variant key.
+    De-duplicated by marketplace_variant key. store_ids restricts this to a
+    Team Member's assigned stores (None = no restriction, a real sub-user).
     Returns an openpyxl Workbook.
     """
     import openpyxl
@@ -483,11 +484,16 @@ def generate_mapping_template(sub_user):
         )
         .select_related('order__store')
     )
+    if store_ids is not None:
+        unmatched_items = unmatched_items.filter(order__store_id__in=store_ids)
 
     # Build lookup: variant_key → existing ProductMapping (if any)
+    mapping_qs = ProductMapping.objects.filter(sub_user=sub_user)
+    if store_ids is not None:
+        mapping_qs = mapping_qs.filter(store_id__in=store_ids)
     existing_mappings = {
         m.marketplace_variant: m
-        for m in ProductMapping.objects.filter(sub_user=sub_user).select_related('pc_variant__pc_product')
+        for m in mapping_qs.select_related('pc_variant__pc_product')
     }
 
     seen_keys = set()
@@ -533,10 +539,12 @@ def generate_mapping_template(sub_user):
     return wb
 
 
-def export_saved_mappings(sub_user):
+def export_saved_mappings(sub_user, store_ids=None):
     """
     Build an Excel file with all saved ProductMappings for a sub-user.
-    Both catalog and marketplace columns are pre-filled.
+    Both catalog and marketplace columns are pre-filled. store_ids restricts
+    this to a Team Member's assigned stores (None = no restriction, a real
+    sub-user).
     Returns an openpyxl Workbook.
     """
     import openpyxl
@@ -568,6 +576,8 @@ def export_saved_mappings(sub_user):
         .select_related('pc_variant__pc_product', 'store')
         .order_by('pc_variant__pc_product__name', 'marketplace_variant')
     )
+    if store_ids is not None:
+        mappings = mappings.filter(store_id__in=store_ids)
 
     for row_idx, m in enumerate(mappings, start=2):
         variant = m.pc_variant

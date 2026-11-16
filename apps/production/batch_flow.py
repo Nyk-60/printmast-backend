@@ -206,19 +206,22 @@ def preflight(orders, sheet_width_in=22.0, margin_in=0.2) -> Dict:
         elif order.address_status == Order.AddressStatus.WARNING:
             found.append(('warning', 'address_warning', 'ShipStation flagged the address (e.g. apartment/suite) — worth a look.'))
 
-        weight_oz, _ = get_order_shipping_config(order)
-        if not weight_oz:
-            found.append(('error', 'no_weight', 'Order weight is unknown — match its products or set a weight override.'))
+        # A seller-uploaded label needs none of these — no rate/label will ever be
+        # bought for this order (see Order.label_source / purchase_label_for_order).
+        if order.label_source != Order.LabelSource.UPLOADED:
+            weight_oz, _ = get_order_shipping_config(order)
+            if not weight_oz:
+                found.append(('error', 'no_weight', 'Order weight is unknown — match its products or set a weight override.'))
 
-        if not order.selected_carrier_code or order.shipping_cost is None:
-            found.append(('error', 'no_shipping_selected', 'No shipping method/price was selected for this order.'))
+            if not order.selected_carrier_code or order.shipping_cost is None:
+                found.append(('error', 'no_shipping_selected', 'No shipping method/price was selected for this order.'))
 
-        category = effective_shipping_category(order)
-        if not any(o.category == category and o.provider in accounts for o in options):
-            found.append((
-                'error', 'no_shipping_option',
-                f'No active provider has a "{category}" shipping option configured (Shipping Settings).',
-            ))
+            category = effective_shipping_category(order)
+            if not any(o.category == category and o.provider in accounts for o in options):
+                found.append((
+                    'error', 'no_shipping_option',
+                    f'No active provider has a "{category}" shipping option configured (Shipping Settings).',
+                ))
 
         found.extend(_design_problems(order, sheet_width_in, margin_in))
 

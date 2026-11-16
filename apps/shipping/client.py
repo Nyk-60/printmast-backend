@@ -222,6 +222,67 @@ class ShipStationClient:
             'phone':      store.ship_from_phone or '',
         }
 
+    @staticmethod
+    def _db_items_payload(order):
+        """The createorder item-dict shape, built fresh from our DB — same shape
+        used (duplicated) across update_order_address/update_item_personalization/
+        update_item_quantity/update_order_notes/etc.; the one place resync_order
+        uses it to rebuild the whole items array in one shot."""
+        return [
+            {
+                'orderItemId': int(i.shipstation_item_id) if i.shipstation_item_id else None,
+                'sku':         i.marketplace_sku or '',
+                'name':        i.raw_product_name or '',
+                'imageUrl':    i.image_url or '',
+                'quantity':    i.quantity,
+                'unitPrice':   float(i.unit_price),
+                'options':     [{'name': k, 'value': v} for k, v in (i.raw_options or {}).items()],
+                'adjustment':  float(i.unit_price) < 0,
+            }
+            for i in order.items.all()
+        ]
+
+    def resync_order(self, order):
+        """Full resync — rebuilds everything we know about this order (shipTo,
+        notes/gift, every item with its correct orderItemId where known) and
+        upserts it in one POST. Used to recover from a failed partial push
+        (apps/orders/views.py::_sync_to_shipstation) without needing to know
+        which specific edit failed: this always writes the complete current
+        state, so it's safe to call repeatedly.
+
+        Keyed on the existing ShipStation orderId (fetched via GET first, same
+        as every other method here) — ShipStation's createorder updates that
+        order in place, it does not create a new one. Items keep their existing
+        orderItemId where we have it, so they're updated in place too, not
+        duplicated — only items we've never successfully pushed (orderItemId
+        still empty) go in as new lines, exactly as ShipStation would expect."""
+        if self._account.api_version != 'V1':
+            return None
+
+        raw = self._get(f'/orders/{order.shipstation_order_id}')
+        raw['shipTo'] = {
+            'name':        order.ship_to_name,
+            'company':     order.ship_to_company,
+            'street1':     order.ship_to_address1,
+            'street2':     order.ship_to_address2,
+            'city':        order.ship_to_city,
+            'state':       order.ship_to_state,
+            'postalCode':  order.ship_to_postal_code,
+            'country':     order.ship_to_country or 'US',
+            'residential': True,
+        }
+        raw['billTo'] = raw.get('billTo') or {'name': order.ship_to_name}
+        ship_from = self.build_ship_from(order)
+        if ship_from:
+            raw['shipFrom'] = ship_from
+        raw['customerNotes'] = order.buyer_note or ''
+        raw['internalNotes'] = order.internal_note or ''
+        raw['giftMessage']   = order.gift_message or ''
+        raw['gift']          = bool(order.is_gift)
+        raw['items'] = self._db_items_payload(order)
+
+        return self._post('/orders/createorder', json=raw)
+
     def update_order_address(self, order):
         """Push updated shipTo address to ShipStation for an existing order."""
         ship_to = {
@@ -310,6 +371,152 @@ class ShipStationClient:
         else:
             # V2: partial update not supported for item options via simple patch;
             # fall back to no-op (personalization lives on our platform only)
+            return None
+
+    def update_item_quantity(self, order, item):
+        """Push a single item's quantity change to ShipStation. Same
+        GET-mutate-POST shape as update_item_personalization."""
+        if self._account.api_version == 'V1':
+            raw = self._get(f'/orders/{order.shipstation_order_id}')
+            raw['shipTo'] = raw.get('shipTo') or {}
+            raw['billTo'] = raw.get('billTo') or {}
+
+            ss_items = raw.get('items') or []
+            for ss_item in ss_items:
+                if str(ss_item.get('orderItemId', '')) == str(item.shipstation_item_id):
+                    ss_item['quantity'] = item.quantity
+                    break
+
+            if not ss_items:
+                db_items = list(order.items.all())
+                raw['items'] = [
+                    {
+                        'orderItemId': int(i.shipstation_item_id) if i.shipstation_item_id else None,
+                        'sku':         i.marketplace_sku or '',
+                        'name':        i.raw_product_name or '',
+                        'imageUrl':    i.image_url or '',
+                        'quantity':    i.quantity,
+                        'unitPrice':   float(i.unit_price),
+                        'options':     [{'name': k, 'value': v} for k, v in (i.raw_options or {}).items()],
+                        'adjustment':  float(i.unit_price) < 0,
+                    }
+                    for i in db_items
+                ]
+
+            return self._post('/orders/createorder', json=raw)
+        else:
+            return None
+
+    def update_item_sku(self, order, item):
+        """Push a single item's SKU change to ShipStation. Same GET-mutate-POST
+        shape as update_item_quantity/update_item_personalization."""
+        if self._account.api_version == 'V1':
+            raw = self._get(f'/orders/{order.shipstation_order_id}')
+            raw['shipTo'] = raw.get('shipTo') or {}
+            raw['billTo'] = raw.get('billTo') or {}
+
+            ss_items = raw.get('items') or []
+            for ss_item in ss_items:
+                if str(ss_item.get('orderItemId', '')) == str(item.shipstation_item_id):
+                    ss_item['sku'] = item.marketplace_sku or ''
+                    break
+
+            if not ss_items:
+                db_items = list(order.items.all())
+                raw['items'] = [
+                    {
+                        'orderItemId': int(i.shipstation_item_id) if i.shipstation_item_id else None,
+                        'sku':         i.marketplace_sku or '',
+                        'name':        i.raw_product_name or '',
+                        'imageUrl':    i.image_url or '',
+                        'quantity':    i.quantity,
+                        'unitPrice':   float(i.unit_price),
+                        'options':     [{'name': k, 'value': v} for k, v in (i.raw_options or {}).items()],
+                        'adjustment':  float(i.unit_price) < 0,
+                    }
+                    for i in db_items
+                ]
+
+            return self._post('/orders/createorder', json=raw)
+        else:
+            return None
+
+    def remove_item_by_id(self, order, shipstation_item_id):
+        """Remove one item (by its ShipStation orderItemId) from an existing
+        order. No-op if the item was never pushed to ShipStation yet (e.g. a
+        just-added manual item whose push hasn't landed)."""
+        if not shipstation_item_id:
+            return None
+        if self._account.api_version == 'V1':
+            raw = self._get(f'/orders/{order.shipstation_order_id}')
+            raw['shipTo'] = raw.get('shipTo') or {}
+            raw['billTo'] = raw.get('billTo') or {}
+            raw['items'] = [
+                si for si in (raw.get('items') or [])
+                if str(si.get('orderItemId', '')) != str(shipstation_item_id)
+            ]
+            return self._post('/orders/createorder', json=raw)
+        else:
+            return None
+
+    def add_item_to_order(self, order, item):
+        """Push a staff-added/cloned item (no shipstation_item_id yet) onto an
+        existing ShipStation order. Returns the full createorder response so the
+        caller can find the orderItemId ShipStation assigned (match by sku+name+
+        quantity — there's nothing else to key on before the first push)."""
+        if self._account.api_version == 'V1':
+            raw = self._get(f'/orders/{order.shipstation_order_id}')
+            raw['shipTo'] = raw.get('shipTo') or {}
+            raw['billTo'] = raw.get('billTo') or {}
+
+            ss_items = raw.get('items') or []
+            ss_items.append({
+                'orderItemId': None,
+                'sku':         item.marketplace_sku or '',
+                'name':        item.raw_product_name or '',
+                'imageUrl':    item.image_url or '',
+                'quantity':    item.quantity,
+                'unitPrice':   float(item.unit_price),
+                'options':     [{'name': k, 'value': v} for k, v in (item.raw_options or {}).items()],
+                'adjustment':  False,
+            })
+            raw['items'] = ss_items
+
+            return self._post('/orders/createorder', json=raw)
+        else:
+            return None
+
+    def update_order_notes(self, order):
+        """Push buyer note / internal note / gift info to ShipStation. Field
+        names are the reverse of the mapping used on import — see
+        apps/shipping/tasks.py::_upsert_orders."""
+        if self._account.api_version == 'V1':
+            raw = self._get(f'/orders/{order.shipstation_order_id}')
+            raw['shipTo'] = raw.get('shipTo') or {}
+            raw['billTo'] = raw.get('billTo') or {}
+            raw['customerNotes'] = order.buyer_note or ''
+            raw['internalNotes'] = order.internal_note or ''
+            raw['giftMessage']   = order.gift_message or ''
+            raw['gift']          = bool(order.is_gift)
+
+            if not raw.get('items'):
+                db_items = list(order.items.all())
+                raw['items'] = [
+                    {
+                        'orderItemId': int(i.shipstation_item_id) if i.shipstation_item_id else None,
+                        'sku':         i.marketplace_sku or '',
+                        'name':        i.raw_product_name or '',
+                        'imageUrl':    i.image_url or '',
+                        'quantity':    i.quantity,
+                        'unitPrice':   float(i.unit_price),
+                        'options':     [{'name': k, 'value': v} for k, v in (i.raw_options or {}).items()],
+                        'adjustment':  float(i.unit_price) < 0,
+                    }
+                    for i in db_items
+                ]
+
+            return self._post('/orders/createorder', json=raw)
+        else:
             return None
 
     def update_order_shipping_config(self, order, *, weight_oz, dimensions=None):

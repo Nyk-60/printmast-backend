@@ -61,8 +61,7 @@ class SubUserProfileAdmin(admin.ModelAdmin):
         ('Shipping Markup', {'fields': ('shipping_markup_type', 'shipping_markup_value')}),
         ('Print Area Pricing', {'fields': ('extra_print_area_enabled', 'extra_print_area_price')}),
         ('Permissions', {'fields': (
-            'can_edit_orders', 'can_upload_product_mapping', 'can_upload_designs',
-            'can_send_to_print', 'can_track_orders', 'can_view_financials', 'can_export_financials',
+            'can_edit_orders', 'can_upload_product_mapping',
             'can_reship_without_pc_approval', 'can_report_lost_shipment',
         )}),
         ('Auto-matching', {'fields': ('auto_product_matching', 'auto_design_matching', 'auto_shipping_rules')}),

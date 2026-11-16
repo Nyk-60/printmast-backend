@@ -34,6 +34,7 @@ class User(AbstractUser):
         SUPERADMIN = 'superadmin', 'Super Admin'
         PRINT_CENTER = 'print_center', 'Print Center'
         SUB_USER = 'sub_user', 'Sub User'
+        TEAM_MEMBER = 'team_member', 'Team Member'
 
     username = None
     email = models.EmailField(unique=True)
@@ -58,6 +59,10 @@ class User(AbstractUser):
     @property
     def is_sub_user(self):
         return self.role == self.Role.SUB_USER
+
+    @property
+    def is_team_member(self):
+        return self.role == self.Role.TEAM_MEMBER
 
 
 class PrintCenterProfile(TimeStampedModel):
@@ -238,14 +243,12 @@ class SubUserProfile(TimeStampedModel):
     extra_print_area_enabled = models.BooleanField(default=False)
     extra_print_area_price = models.DecimalField(max_digits=8, decimal_places=2, default=0)
 
-    # Granular permissions
+    # Granular permissions — only ones that represent a genuine, trust-based
+    # restriction a PC might withhold; everything else a sub-user needs to
+    # actually use the platform (upload designs, send to print, track orders,
+    # view/export their own financials) stays on for everyone, not a toggle.
     can_edit_orders = models.BooleanField(default=True)
     can_upload_product_mapping = models.BooleanField(default=True)
-    can_upload_designs = models.BooleanField(default=True)
-    can_send_to_print = models.BooleanField(default=True)
-    can_track_orders = models.BooleanField(default=True)
-    can_view_financials = models.BooleanField(default=True)
-    can_export_financials = models.BooleanField(default=True)
     can_reship_without_pc_approval = models.BooleanField(
         default=False,
         help_text='A print-center-fault reship from this sub-user skips PC approval and is '
@@ -268,6 +271,31 @@ class SubUserProfile(TimeStampedModel):
 
     def can_afford(self, amount):
         return (self.balance - amount) >= -abs(self.negative_balance_limit)
+
+
+class TeamMemberProfile(TimeStampedModel):
+    """A sub-user-created, store-scoped login: same panel as the sub-user's
+    own (see apps.accounts.scoping.get_sub_user_scope), restricted to a
+    subset of the parent's assigned_stores. No separate balance — everything
+    a team member does bills the parent sub_user; BalanceTransaction.
+    created_by (already populated everywhere a transaction is written) is
+    what lets finance exports show which team member did what."""
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='team_member_profile'
+    )
+    sub_user = models.ForeignKey(
+        SubUserProfile, on_delete=models.CASCADE, related_name='team_members'
+    )
+    assigned_stores = models.ManyToManyField(
+        'shipping.Store', related_name='assigned_team_members', blank=True
+    )
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, related_name='created_team_members'
+    )
+
+    def __str__(self):
+        return f"{self.user.email} (team member of {self.sub_user.user.email})"
 
 
 class ShippingAutoRule(TimeStampedModel):

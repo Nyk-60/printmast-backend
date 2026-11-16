@@ -21,7 +21,8 @@ from rest_framework.views import APIView
 from apps.accounts.models import (
     BalanceTransaction, PrintCenterInvoice, SubUserInvoice, SubUserProfile,
 )
-from apps.accounts.permissions import IsPrintCenter
+from apps.accounts.permissions import IsPrintCenter, IsSubUser
+from apps.accounts.scoping import get_sub_user_scope
 from apps.accounts.serializers import SubUserInvoiceSerializer
 
 from .serializers import (
@@ -473,10 +474,12 @@ def _make_export_response(qs, fmt, filename_base, report, balance_map=None):
 # ── Sub-user views ────────────────────────────────────────────────────────────
 
 class MySummaryView(APIView):
-    permission_classes = (IsAuthenticated,)
+    # Account-level finance — a Team Member never sees balance/debt, only the
+    # real sub-user does (unlike IsAuthenticated+get_sub_user_scope elsewhere).
+    permission_classes = (IsSubUser,)
 
     def get(self, request):
-        sub = request.user.sub_user_profile
+        sub, _ = get_sub_user_scope(request.user)
         date_from, date_to = _parse_date_range(request)
         qs = BalanceTransaction.objects.filter(sub_user=sub)
         data = _compute_summary(sub, qs, date_from, date_to)
@@ -484,10 +487,10 @@ class MySummaryView(APIView):
 
 
 class MyTransactionListView(APIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsSubUser,)
 
     def get(self, request):
-        sub = request.user.sub_user_profile
+        sub, _ = get_sub_user_scope(request.user)
         date_from, date_to = _parse_date_range(request)
         tx_type = request.query_params.get('type')
         report = request.query_params.get('report', 'balance').lower()
@@ -534,10 +537,10 @@ class _ExportMixin:
 
 
 class MyTransactionExportView(_ExportMixin, APIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsSubUser,)
 
     def get(self, request):
-        sub = request.user.sub_user_profile
+        sub, _ = get_sub_user_scope(request.user)
         date_from, date_to = _parse_date_range(request)
         fmt = request.query_params.get('format', 'csv').lower()
         report = request.query_params.get('report', 'balance').lower()
@@ -818,10 +821,10 @@ def _build_filter_options(qs, pc):
 class MyTransactionFilterOptionsView(APIView):
     """Distinct values for the Excel-style column filter dropdowns on a
     sub-user's own Balance History table."""
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsSubUser,)
 
     def get(self, request):
-        sub = request.user.sub_user_profile
+        sub, _ = get_sub_user_scope(request.user)
         date_from, date_to = _parse_date_range(request)
         qs = _filter_transactions(
             BalanceTransaction.objects.filter(sub_user=sub), date_from, date_to,
@@ -924,11 +927,12 @@ def _invoice_filter(qs, request):
 
 
 class MyInvoiceListView(generics.ListAPIView):
-    permission_classes = (IsAuthenticated,)
+    permission_classes = (IsSubUser,)
     serializer_class = SubUserInvoiceSerializer
 
     def get_queryset(self):
-        qs = SubUserInvoice.objects.filter(sub_user=self.request.user.sub_user_profile)
+        sub, _ = get_sub_user_scope(self.request.user)
+        qs = SubUserInvoice.objects.filter(sub_user=sub)
         return _invoice_filter(qs, self.request)
 
 

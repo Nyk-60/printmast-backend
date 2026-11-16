@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import PrintCenterProfile, SubUserProfile
 from apps.accounts.permissions import IsPrintCenter
+from apps.accounts.scoping import get_sub_user_scope
 
 from .byelabel_client import ByeLabelClient
 from .client import ShipStationClient
@@ -163,12 +164,12 @@ class StoreListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_sub_user:
-            return (
-                Store.objects.filter(assigned_sub_users=user.sub_user_profile)
-                .select_related('shipstation_account')
-                .order_by('name')
-            )
+        sub_user, store_ids = get_sub_user_scope(user)
+        if sub_user is not None:
+            qs = Store.objects.filter(assigned_sub_users=sub_user)
+            if store_ids is not None:
+                qs = qs.filter(id__in=store_ids)
+            return qs.select_related('shipstation_account').order_by('name')
         return Store.objects.filter(
             shipstation_account__print_center=user.print_center_profile
         ).select_related('shipstation_account').prefetch_related('assigned_sub_users').order_by('name')
@@ -240,10 +241,11 @@ class MyStoresSyncView(APIView):
         from .tasks import sync_orders_for_store
 
         user = request.user
-        if user.is_sub_user:
-            stores = Store.objects.filter(
-                assigned_sub_users=user.sub_user_profile, is_active=True
-            )
+        sub_user, store_ids = get_sub_user_scope(user)
+        if sub_user is not None:
+            stores = Store.objects.filter(assigned_sub_users=sub_user, is_active=True)
+            if store_ids is not None:
+                stores = stores.filter(id__in=store_ids)
         elif user.is_print_center:
             stores = Store.objects.filter(
                 shipstation_account__print_center=user.print_center_profile, is_active=True
@@ -311,9 +313,13 @@ class StoreUpdateView(APIView):
 
     def patch(self, request, pk):
         user = request.user
-        if user.is_sub_user:
+        sub_user, store_ids = get_sub_user_scope(user)
+        if sub_user is not None:
             try:
-                store = Store.objects.get(pk=pk, assigned_sub_users=user.sub_user_profile)
+                store_qs = Store.objects.filter(pk=pk, assigned_sub_users=sub_user)
+                if store_ids is not None:
+                    store_qs = store_qs.filter(id__in=store_ids)
+                store = store_qs.get()
             except Store.DoesNotExist:
                 raise NotFound()
         elif user.is_print_center:
@@ -496,7 +502,7 @@ class MyServiceOptionsView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        sub_profile = getattr(request.user, 'sub_user_profile', None)
+        sub_profile, _ = get_sub_user_scope(request.user)
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
         qs = ShippingServiceOption.objects.filter(
@@ -510,7 +516,7 @@ class MyServiceDefaultsView(APIView):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        sub_profile = getattr(request.user, 'sub_user_profile', None)
+        sub_profile, _ = get_sub_user_scope(request.user)
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
         defaults = {
@@ -527,7 +533,7 @@ class MyServiceDefaultsView(APIView):
         return Response(result)
 
     def put(self, request):
-        sub_profile = getattr(request.user, 'sub_user_profile', None)
+        sub_profile, _ = get_sub_user_scope(request.user)
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
 
@@ -559,7 +565,7 @@ class RatesView(APIView):
         # Determine which store/ShipStation account to use — prefer the order's
         # actual store (each store has its own ship-from address), falling back
         # to the sub-user's first assigned store only when no order is given.
-        sub_profile = getattr(request.user, 'sub_user_profile', None)
+        sub_profile, store_ids = get_sub_user_scope(request.user)
         if not sub_profile:
             return Response({'detail': 'No sub user profile'}, status=400)
 
@@ -570,14 +576,23 @@ class RatesView(APIView):
             from apps.orders.models import Order
             from .utils import calculate_order_dimensions
             try:
-                order = Order.objects.select_related('store__shipstation_account').prefetch_related(
+                order_qs = Order.objects.filter(sub_user=sub_profile)
+                if store_ids is not None:
+                    order_qs = order_qs.filter(store_id__in=store_ids)
+                order = order_qs.select_related('store__shipstation_account').prefetch_related(
                     'items__pc_variant__dimension_rules'
-                ).get(id=order_id, sub_user=sub_profile)
+                ).get(id=order_id)
                 dimensions = calculate_order_dimensions(order)
             except Order.DoesNotExist:
                 pass
 
-        store = order.store if order else sub_profile.assigned_stores.filter(is_active=True).first()
+        if order:
+            store = order.store
+        else:
+            fallback_qs = sub_profile.assigned_stores.filter(is_active=True)
+            if store_ids is not None:
+                fallback_qs = fallback_qs.filter(id__in=store_ids)
+            store = fallback_qs.first()
         if not store:
             return Response({'detail': 'No active store assigned'}, status=400)
 

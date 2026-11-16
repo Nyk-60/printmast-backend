@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.permissions import IsPrintCenter, IsSuperAdmin
+from apps.accounts.scoping import get_sub_user_scope
 
 from .models import (
     Brand,
@@ -414,8 +415,9 @@ class MyCatalogView(generics.ListAPIView):
     search_fields = ('name', 'sku')
 
     def get_queryset(self):
+        sub_user, _ = get_sub_user_scope(self.request.user)
         return PrintCenterProduct.objects.filter(
-            print_center=self.request.user.sub_user_profile.print_center,
+            print_center=sub_user.print_center,
             is_active=True,
         ).select_related('brand', 'category').prefetch_related('variants')
 
@@ -425,10 +427,11 @@ class MyCatalogProductView(generics.RetrieveAPIView):
     serializer_class = PrintCenterProductDetailSerializer
 
     def get_object(self):
+        sub_user, _ = get_sub_user_scope(self.request.user)
         try:
             return PrintCenterProduct.objects.prefetch_related('variants', 'print_areas').get(
                 pk=self.kwargs['pk'],
-                print_center=self.request.user.sub_user_profile.print_center,
+                print_center=sub_user.print_center,
                 is_active=True,
             )
         except PrintCenterProduct.DoesNotExist:
@@ -445,7 +448,8 @@ class SubCatalogExportView(APIView):
         from openpyxl.styles import Alignment, Font, PatternFill
         from django.http import HttpResponse
 
-        print_center = request.user.sub_user_profile.print_center
+        sub_user, _ = get_sub_user_scope(request.user)
+        print_center = sub_user.print_center
         products = (
             PrintCenterProduct.objects
             .filter(print_center=print_center, is_active=True)
@@ -495,15 +499,117 @@ class SubCatalogExportView(APIView):
         return resp
 
 
+class PcCatalogQuoteExportView(APIView):
+    """Customer-facing price list — every active product/variant with its
+    price, the PC's own logo + name at the top — for a PC to hand to a
+    prospective buyer. Distinct from SubCatalogExportView above, which is an
+    internal mapping reference (no prices, no branding) for existing sellers."""
+    permission_classes = (IsPrintCenter,)
+
+    def get(self, request):
+        from django.http import HttpResponse
+        from django.utils import timezone
+
+        from apps.core.utils import size_order_annotation
+
+        pc = request.user.print_center_profile
+        products = (
+            PrintCenterProduct.objects
+            .filter(print_center=pc, is_active=True)
+            .select_related('category')
+            .prefetch_related('variants')
+            .order_by('category__sort_order', 'category__name', 'sort_order', 'name')
+        )
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Catalog'
+
+        TEAL = 'FF2D9E93'
+        header_fill = PatternFill(fill_type='solid', fgColor=TEAL)
+        white_bold = Font(bold=True, color='FFFFFFFF', size=11)
+        title_font = Font(bold=True, size=18)
+        subtitle_font = Font(size=11, bold=True, color=TEAL)
+        meta_font = Font(size=9, color='FF888888')
+
+        name_col = 'A'
+        if pc.logo:
+            from openpyxl.drawing.image import Image as XLImage
+
+            img = XLImage(pc.logo.path)
+            # Fit within a box without distorting the logo's own aspect ratio
+            # — stretching a non-square logo to a fixed square squashed it.
+            MAX_W, MAX_H = 130, 70
+            scale = min(MAX_W / img.width, MAX_H / img.height)
+            img.width, img.height = img.width * scale, img.height * scale
+            ws.add_image(img, 'A1')
+            ws.row_dimensions[1].height = max(60, img.height * 0.75)
+            name_col = 'C'
+
+        ws.merge_cells(f'{name_col}1:F1')
+        ws[f'{name_col}1'] = pc.company_name
+        ws[f'{name_col}1'].font = title_font
+
+        ws.merge_cells(f'{name_col}2:F2')
+        ws[f'{name_col}2'] = 'Product Catalog'
+        ws[f'{name_col}2'].font = subtitle_font
+
+        ws.merge_cells(f'{name_col}3:F3')
+        ws[f'{name_col}3'] = f'Generated {timezone.now().strftime("%b %d, %Y")}'
+        ws[f'{name_col}3'].font = meta_font
+
+        header_row = 5
+        headers = ['Category', 'Product', 'Size', 'Color', 'Price']
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col, value=h)
+            cell.font = white_bold
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        ws.row_dimensions[header_row].height = 22
+
+        row = header_row + 1
+        for product in products:
+            variants = list(
+                product.variants.filter(is_active=True)
+                .annotate(size_ord=size_order_annotation())
+                .order_by('size_ord', 'color')
+            )
+            for variant in variants:
+                ws.cell(row=row, column=1, value=product.category.name if product.category else '')
+                ws.cell(row=row, column=2, value=product.name)
+                ws.cell(row=row, column=3, value=variant.size)
+                ws.cell(row=row, column=4, value=variant.color)
+                price_cell = ws.cell(row=row, column=5, value=float(variant.cost))
+                price_cell.number_format = '$#,##0.00'
+                row += 1
+
+        last_row = max(row - 1, header_row)
+        ws.auto_filter.ref = f'A{header_row}:E{last_row}'
+        for col, w in enumerate([18, 36, 12, 22, 12], 1):
+            ws.column_dimensions[get_column_letter(col)].width = w
+
+        buf = BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        resp = HttpResponse(
+            buf.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        safe_name = ''.join(c if c.isalnum() else '_' for c in pc.company_name) or 'catalog'
+        resp['Content-Disposition'] = f'attachment; filename="{safe_name}_catalog.xlsx"'
+        return resp
+
+
 class SubCatalogColorClassificationView(APIView):
     """Sub-user reads/writes per-product dark/light color classification."""
     permission_classes = (IsAuthenticated,)
 
     def _get_product(self, request, pk):
+        sub_user, _ = get_sub_user_scope(request.user)
         try:
             return PrintCenterProduct.objects.prefetch_related('variants').get(
                 pk=pk,
-                print_center=request.user.sub_user_profile.print_center,
+                print_center=sub_user.print_center,
                 is_active=True,
             )
         except PrintCenterProduct.DoesNotExist:
@@ -512,7 +618,7 @@ class SubCatalogColorClassificationView(APIView):
     def get(self, request, pk):
         from apps.designs.models import SubUserProductColorSetting
         product  = self._get_product(request, pk)
-        sub_user = request.user.sub_user_profile
+        sub_user, _ = get_sub_user_scope(request.user)
         setting  = SubUserProductColorSetting.objects.filter(
             sub_user=sub_user, pc_product=product
         ).prefetch_related('entries').first()
@@ -534,7 +640,7 @@ class SubCatalogColorClassificationView(APIView):
     def put(self, request, pk):
         from apps.designs.models import SubUserProductColorEntry, SubUserProductColorSetting
         product    = self._get_product(request, pk)
-        sub_user   = request.user.sub_user_profile
+        sub_user, _ = get_sub_user_scope(request.user)
         use_custom = bool(request.data.get('use_custom', False))
         entries_data = request.data.get('entries', [])
 

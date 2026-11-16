@@ -30,6 +30,9 @@ from .views import (
     SubUserToggleActiveView,
     SubUserTransactionsView,
     SuperAdminDashboardStatsView,
+    TeamMemberDetailView,
+    TeamMemberListCreateView,
+    TeamMemberStoresView,
 )
 
 urlpatterns = [
@@ -68,6 +71,11 @@ urlpatterns = [
     path('print-center/sub-users/<int:pk>/toggle-active/', SubUserToggleActiveView.as_view(), name='pc-sub-user-toggle'),
     path('print-center/sub-users/<int:pk>/add-balance/', AddBalanceView.as_view(), name='pc-sub-user-add-balance'),
     path('print-center/sub-users/<int:pk>/transactions/', SubUserTransactionsView.as_view(), name='pc-sub-user-transactions'),
+
+    # Sub User — team member management
+    path('my/team-members/', TeamMemberListCreateView.as_view(), name='my-team-member-list'),
+    path('my/team-members/<int:pk>/', TeamMemberDetailView.as_view(), name='my-team-member-detail'),
+    path('my/team-members/<int:pk>/stores/', TeamMemberStoresView.as_view(), name='my-team-member-stores'),
 
     # Sub User — self-service
     path('my/transactions/', MyTransactionsView.as_view(), name='my-transactions'),

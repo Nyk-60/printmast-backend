@@ -8,7 +8,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsPrintCenter, IsSubUser
+from apps.accounts.permissions import IsPrintCenter, IsSubUserOrTeamMember
+from apps.accounts.scoping import get_sub_user_scope
 from apps.orders.models import Order, OrderItem
 
 from .models import MAX_RESHIP_REQUESTS_PER_ORDER, ReshipRequest
@@ -34,16 +35,17 @@ _ADDRESS_OVERRIDE_FIELDS = (
 
 
 class ReshipRequestCreateView(APIView):
-    permission_classes = (IsSubUser,)
+    permission_classes = (IsSubUserOrTeamMember,)
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
-        sub_user = request.user.sub_user_profile
+        sub_user, store_ids = get_sub_user_scope(request.user)
 
         try:
-            original_order = Order.objects.get(
-                pk=request.data.get('original_order'), sub_user=sub_user, is_hidden=False,
-            )
+            order_qs = Order.objects.filter(sub_user=sub_user, is_hidden=False)
+            if store_ids is not None:
+                order_qs = order_qs.filter(store_id__in=store_ids)
+            original_order = order_qs.get(pk=request.data.get('original_order'))
         except (Order.DoesNotExist, ValueError, TypeError):
             raise NotFound('Order not found.')
 
@@ -159,10 +161,14 @@ class ReshipRequestListView(generics.ListAPIView):
             qs = ReshipRequest.objects.filter(
                 original_order__store__shipstation_account__print_center=user.print_center_profile,
             )
-        elif getattr(user, 'is_sub_user', False):
-            qs = ReshipRequest.objects.filter(sub_user=user.sub_user_profile)
         else:
-            qs = ReshipRequest.objects.none()
+            sub_user, store_ids = get_sub_user_scope(user)
+            if sub_user is not None:
+                qs = ReshipRequest.objects.filter(sub_user=sub_user)
+                if store_ids is not None:
+                    qs = qs.filter(original_order__store_id__in=store_ids)
+            else:
+                qs = ReshipRequest.objects.none()
 
         status_param = self.request.query_params.get('status')
         if status_param:
